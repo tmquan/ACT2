@@ -5,7 +5,7 @@ from typing import List, Optional, Dict
 
 import torch
 from torch.utils.data import DataLoader, Dataset
-from pytorch_lightning import LightningDataModule
+from lightning import LightningDataModule
 from monai.transforms import (
     apply_transform,
     Compose,
@@ -61,8 +61,8 @@ class ACT2Dataset(Dataset):
         # Here we map our dataset keys ('tif', 'png') to the model's expected keys.
         final_sample = {
             self.hint_key: transformed_item['tif'],
-            self.image_key: transformed_item['png'],
             self.txt_key: txt_content,
+            self.image_key: transformed_item['png'],
         }
 
         return final_sample
@@ -107,7 +107,8 @@ class ACT2DataModule(LightningDataModule):
 
         # Define MONAI transforms
         self.train_transforms = Compose([
-            LoadImageDict(keys=["tif", "png"], image_only=True),
+            LoadImageDict(keys=["tif"], image_only=True, reader="ITKReader"),
+            LoadImageDict(keys=["png"], image_only=True, reader="PILReader"),
             EnsureChannelFirstDict(keys=["tif", "png"]),
             RandSpatialCropDict(keys=["tif", "png"], roi_size=(self.image_H, self.image_W), random_size=False),
             RandAxisFlipDict(keys=["tif", "png"], prob=0.75),
@@ -117,7 +118,8 @@ class ACT2DataModule(LightningDataModule):
         ])
 
         self.val_transforms = Compose([
-            LoadImageDict(keys=["tif", "png"], image_only=True),
+            LoadImageDict(keys=["tif"], image_only=True, reader="ITKReader"),
+            LoadImageDict(keys=["png"], image_only=True, reader="PILReader"),
             EnsureChannelFirstDict(keys=["tif", "png"]),
             RandSpatialCropDict(keys=["tif", "png"], roi_size=(self.image_H, self.image_W), random_size=False),
             RandAxisFlipDict(keys=["tif", "png"], prob=0.00),
