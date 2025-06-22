@@ -1,6 +1,9 @@
 import torch
 import torch.nn.functional as F
 from lightning import LightningModule
+import math
+from einops import rearrange
+from typing import Any, Tuple
 
 from imaginaire.lazy_config import LazyCall as L
 from imaginaire.utils import misc
@@ -16,6 +19,7 @@ from cosmos_predict2.configs.base.config_video2world import (
     CosmosReason1Config,
     CosmosGuardrailConfig,
 )
+from cosmos_predict2.conditioner import T2VCondition
 
 
 from cosmos_predict2.conditioner import BooleanFlag, ReMapkey, TextAttr
@@ -94,7 +98,7 @@ PREDICT2_IMAGE2IMAGE_PIPELINE_2B = Video2WorldPipelineConfig(
     rectified_flow_t_scaling_factor=1.0,
     resize_online=True,
     resolution="720",
-    ema=L(EMAConfig)(enabled=False),  # defaults to inference
+    ema=L(EMAConfig)(enabled=True),  # Enable EMA
     sigma_conditional=0.0001,
     sigma_data=1.0,
     state_ch=16,
@@ -122,11 +126,18 @@ PREDICT2_IMAGE2IMAGE_PIPELINE_2B = Video2WorldPipelineConfig(
 class CosmosVideoPredictionModel(LightningModule):
     """
     LightningModule to wrap the Cosmos-Predict2-2B-Video2World model for post-training.
+    This class reuses training logic from cosmos_predict2.models.video2world_model.py for consistency.
     """
     def __init__(self, dit_path: str, text_encoder_path: str, learning_rate: float):
         super().__init__()
         self.save_hyperparameters()
         self.last_prediction = None
+        self.loss_reduce = "mean"
+        self.loss_scale = 1.0 # From Predict2Video2WorldModelConfig defaults
+        if PREDICT2_IMAGE2IMAGE_PIPELINE_2B.adjust_video_noise:
+            self.video_noise_multiplier = math.sqrt(PREDICT2_IMAGE2IMAGE_PIPELINE_2B.state_t)
+        else:
+            self.video_noise_multiplier = 1.0
         
         # Load the pre-trained pipeline from config
         self.pipeline = Video2WorldPipeline.from_config(
@@ -143,6 +154,10 @@ class CosmosVideoPredictionModel(LightningModule):
         # Freeze the tokenizer's parameters and set it to evaluation mode
         self.pipeline.tokenizer.model.model.requires_grad_(False)
         self.pipeline.tokenizer.model.model.eval()
+
+        # Unfreeze the DiT
+        self.pipeline.denoising_model().requires_grad_(True)
+        self.pipeline.denoising_model().train()
 
     @torch.no_grad()
     def _full_denoise_step(self, batch: dict) -> torch.Tensor:
@@ -171,7 +186,7 @@ class CosmosVideoPredictionModel(LightningModule):
         video = (video_placeholder * 255.0).to(torch.uint8)
         
         # --- 2. Encode prompts for Classifier-Free Guidance (CFG) ---
-        cond_embeddings = self.pipeline.encode_prompt(batch['txt']).to(dtype=self.pipeline.torch_dtype)
+        cond_embeddings = self.pipeline.encode_prompt(prompts).to(dtype=self.pipeline.torch_dtype)
         uncond_embeddings = self.pipeline.encode_prompt([""] * B).to(dtype=self.pipeline.torch_dtype)
 
         # --- 3. Assemble the full data batch ---
@@ -231,29 +246,27 @@ class CosmosVideoPredictionModel(LightningModule):
         output_frame = output_video[:, :, 1, :, :]
         return output_frame
 
-    def _iter_denoise_step(self, batch: dict):
+    def training_step(self, batch: dict, batch_idx: int) -> torch.Tensor:
         """
-        A common step for training, performing a single-step denoising process.
-        This is the core of the diffusion model training.
-
-        Returns:
-            torch.Tensor: The calculated loss for this training step.
+        Performs a single training step.
+        This involves running one step of the diffusion denoising process and
+        calculating the loss between the predicted noise and the actual noise.
         """
+        # --- 1. Data Preparation ---
         prompts = batch['txt']
         cond_frame = batch['png']
         target_frame = batch['tif']
 
-        # Create a 3-frame video tensor to satisfy the VAE's kernel size.
-        # We pad by repeating the target frame.
+        # Create a 2-frame video tensor.
         video = torch.stack([cond_frame, target_frame], dim=2)
         video = (video * 255.0).to(torch.uint8)
 
         B, C, T, H, W = video.shape
         
         # Encode the text prompt.
-        text_embeddings = self.pipeline.encode_prompt(batch['txt']).to(dtype=self.pipeline.torch_dtype)
+        text_embeddings = self.pipeline.encode_prompt(prompts).to(dtype=self.pipeline.torch_dtype)
 
-        # Assemble the batch dictionary.
+        # Assemble the batch dictionary for the pipeline.
         data_batch = {
             'video': video,
             't5_text_embeddings': text_embeddings,
@@ -262,57 +275,89 @@ class CosmosVideoPredictionModel(LightningModule):
             'fps': torch.ones((B,), device=video.device, dtype=torch.long),
             'padding_mask': torch.zeros(B, 1, H, W, device=video.device, dtype=self.pipeline.torch_dtype),
         }
-
-        # 1. Get clean latents (x0) for the loss target.
-        _, x0, _ = self.pipeline.get_data_and_condition(data_batch)
-
-        # 2. Sample random timesteps (t) and noise (epsilon).
-        t = torch.rand(B, device=self.device).to(x0.dtype)
-        epsilon = torch.randn_like(x0)
-
-        # 3. Create noisy latents (xt) using the Rectified Flow formula.
-        t_reshaped = t.view(B, *([1] * (x0.dim() - 1)))
-        xt = (1 - t_reshaped) * x0 + t_reshaped * epsilon
         
-        # 4. Get the prediction function from the pipeline (with no guidance for training).
-        x0_fn = self.pipeline.get_x0_fn_from_batch(data_batch, guidance=0.0, is_negative_prompt=False)
+        # --- 2. Core Training Logic (reused from video2world_model.py) ---
+        # Get the input data to noise and denoise and the corresponding conditioner.
+        _, x0_B_C_T_H_W, condition = self.pipeline.get_data_and_condition(data_batch)
 
-        # 5. Predict the clean latent from the noisy latent.
-        # The timestep `t` is used as the noise level `sigma`.
-        sigma = t.view(B, 1)
-        x0_pred = x0_fn(xt, sigma)
+        # Sample pertubation noise levels and N(0, 1) noises
+        sigma_B_T, epsilon_B_C_T_H_W = self.draw_training_sigma_and_epsilon(x0_B_C_T_H_W.size(), condition)
+
+        output_batch, kendall_loss, _, _ = self.compute_loss_with_epsilon_and_sigma(
+            x0_B_C_T_H_W, condition, epsilon_B_C_T_H_W, sigma_B_T
+        )
+
+        if self.loss_reduce == "mean":
+            loss = kendall_loss.mean() * self.loss_scale
+        elif self.loss_reduce == "sum":
+            loss = kendall_loss.sum(dim=1).mean() * self.loss_scale
+        else:
+            raise ValueError(f"Invalid loss_reduce: {self.loss_reduce}")
         
-        # 6. Calculate the Mean Squared Error loss against the original noise.
-        # loss = F.l1_loss(x0_pred, x0)
-        # 6. Calculate loss between scheduled noise and predicted noise.
-        # The "scheduled noise" is the original noise, epsilon.
-        # The "predicted noise" is derived from the model's prediction of x0.
-        # From xt = (1-t)*x0 + t*epsilon, we can get epsilon = (xt - (1-t)*x0)/t
-        predicted_noise = (xt - (1 - t_reshaped) * x0_pred) / (t_reshaped + 1e-9)
-        
-        loss = F.mse_loss(predicted_noise, epsilon)
+        self.log('train/loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        self.log('train/mse_loss', output_batch['mse_loss'], on_step=True, on_epoch=True, prog_bar=False, logger=True)
+        self.log('train/edm_loss', output_batch['edm_loss'], on_step=True, on_epoch=True, prog_bar=False, logger=True)
         
         return loss
 
-    def training_step(self, batch: dict, batch_idx: int) -> torch.Tensor:
-        """
-        Performs a single training step.
-        This involves running one step of the diffusion denoising process and
-        calculating the loss between the predicted noise and the actual noise.
-        """
-        predicted_frame = self._full_denoise_step(batch)
-        if batch_idx == 0:
-            with torch.no_grad():
-                self.last_prediction =  predicted_frame
+    def on_before_optimizer_step(self, optimizer):
+        if self.pipeline.config.ema.enabled:
+            beta = self.ema_beta(self.global_step)
+            self.pipeline.dit_ema_worker.update_average(self.pipeline.dit, self.pipeline.dit_ema, beta=beta)
 
-        # The _iter_denoise_step method encapsulates the core training logic.
-        loss = self._iter_denoise_step(batch)
-        
-        # Log the training loss for monitoring.
-        self.log('train/loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        
-        return 1e2*loss
-    
+    def draw_training_sigma_and_epsilon(self, x0_size: torch.Size, condition: Any) -> Tuple[torch.Tensor, torch.Tensor]:
+        from cosmos_predict2.conditioner import DataType
+        batch_size = x0_size[0]
+        epsilon = torch.randn(x0_size, device=self.device)
+        sigma_B = self.pipeline.scheduler.sample_sigma(batch_size).to(device=self.device)
+        sigma_B_1 = rearrange(sigma_B, "b -> b 1")  # add a dimension for T, all frames share the same sigma
+        is_video_batch = condition.data_type == DataType.VIDEO
+
+        multiplier = self.video_noise_multiplier if is_video_batch else 1
+        sigma_B_1 = sigma_B_1 * multiplier
+        return sigma_B_1, epsilon
+
+    def get_per_sigma_loss_weights(self, sigma: torch.Tensor) -> torch.Tensor:
+        return (sigma**2 + self.pipeline.sigma_data**2) / (sigma * self.pipeline.sigma_data) ** 2
+
+    def compute_loss_with_epsilon_and_sigma(
+        self,
+        x0_B_C_T_H_W: torch.Tensor,
+        condition: T2VCondition,
+        epsilon_B_C_T_H_W: torch.Tensor,
+        sigma_B_T: torch.Tensor,
+    ) -> Tuple[dict, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Compute loss givee epsilon and sigma
+        This method is reused from cosmos_predict2/models/video2world_model.py for consistency.
+        """
+        # Get the mean and stand deviation of the marginal probability distribution.
+        mean_B_C_T_H_W, std_B_T = x0_B_C_T_H_W, sigma_B_T
+        # Generate noisy observations
+        xt_B_C_T_H_W = mean_B_C_T_H_W + epsilon_B_C_T_H_W * rearrange(std_B_T, "b t -> b 1 t 1 1")
+        # make prediction
+        model_pred = self.pipeline.denoise(xt_B_C_T_H_W, sigma_B_T, condition)
+        # loss weights for different noise levels
+        weights_per_sigma_B_T = self.get_per_sigma_loss_weights(sigma=sigma_B_T)
+        # extra loss mask for each sample, for example, human faces, hands
+        pred_mse_B_C_T_H_W = (x0_B_C_T_H_W - model_pred.x0) ** 2
+        edm_loss_B_C_T_H_W = pred_mse_B_C_T_H_W * rearrange(weights_per_sigma_B_T, "b t -> b 1 t 1 1")
+        kendall_loss = edm_loss_B_C_T_H_W
+        output_batch = {
+            "x0": x0_B_C_T_H_W,
+            "xt": xt_B_C_T_H_W,
+            "sigma": sigma_B_T,
+            "weights_per_sigma": weights_per_sigma_B_T,
+            "condition": condition,
+            "model_pred": model_pred,
+            "mse_loss": pred_mse_B_C_T_H_W.mean(),
+            "edm_loss": edm_loss_B_C_T_H_W.mean(),
+            "edm_loss_per_frame": torch.mean(edm_loss_B_C_T_H_W, dim=[1, 3, 4]),
+        }
+        output_batch["loss"] = kendall_loss.mean()
+
+        return output_batch, kendall_loss, pred_mse_B_C_T_H_W, edm_loss_B_C_T_H_W
+
     def eval_step(self, batch: dict, batch_idx: int, stage: str) -> None:
         """
         Performs a single evaluation step (for validation or testing).
@@ -346,4 +391,14 @@ class CosmosVideoPredictionModel(LightningModule):
             self.pipeline.dit.parameters(), 
             lr=self.hparams.learning_rate
         )
-        return optimizer 
+        return optimizer
+
+    def ema_beta(self, iteration: int) -> float:
+        """
+        Calculate the beta value for EMA update.
+        weights = weights * beta + (1 - beta) * new_weights
+        """
+        iteration = iteration + self.pipeline.config.ema.iteration_shift
+        if iteration < 1:
+            return 0.0
+        return (1 - 1 / (iteration + 1)) ** (self.pipeline.ema_exp_coefficient + 1) 
