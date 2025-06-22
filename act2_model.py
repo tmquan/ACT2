@@ -10,7 +10,7 @@ class CosmosVideoPredictionModel(L.LightningModule):
     """
     LightningModule to wrap the Cosmos-Predict2-2B-Video2World model for post-training.
     """
-    def __init__(self, dit_path: str, text_encoder_path: str, learning_rate: float):
+    def __init__(self, dit_path: str, text_encoder_path: str, learning_rate: float = 1e-5):
         super().__init__()
         self.save_hyperparameters()
         self.last_prediction = None
