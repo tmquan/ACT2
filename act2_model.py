@@ -1,38 +1,148 @@
 import torch
 import torch.nn.functional as F
-import lightning as L
-from cosmos_predict2.configs.base.config_video2world import PREDICT2_VIDEO2WORLD_PIPELINE_2B
-from cosmos_predict2.pipelines.video2world import Video2WorldPipeline
+from lightning import LightningModule
+
+from imaginaire.lazy_config import LazyCall as L
 from imaginaire.utils import misc
 
+from cosmos_predict2.configs.base.defaults.ema import EMAConfig
+from cosmos_predict2.configs.base.config_video2world import (
+    PREDICT2_VIDEO2WORLD_PIPELINE_2B,
+    PREDICT2_VIDEO2WORLD_NET_2B,
+    ConditioningStrategy,
+    Video2WorldPipelineConfig,
+    Vid2VidConditioner,
+    TextAttr,
+    CosmosReason1Config,
+    CosmosGuardrailConfig,
+)
 
-class CosmosVideoPredictionModel(L.LightningModule):
+
+from cosmos_predict2.conditioner import BooleanFlag, ReMapkey, TextAttr
+from cosmos_predict2.configs.base.defaults.ema import EMAConfig
+from cosmos_predict2.configs.vid2vid.defaults.conditioner import Vid2VidConditioner
+from cosmos_predict2.models.text2image_dit import SACConfig
+from cosmos_predict2.models.video2world_dit import MinimalV1LVGDiT
+from cosmos_predict2.pipelines.video2world import Video2WorldPipeline
+from cosmos_predict2.tokenizers.tokenizer import TokenizerInterface
+from imaginaire.config import make_freezable
+from imaginaire.lazy_config import LazyCall as L
+from imaginaire.lazy_config import LazyDict
+
+# Cosmos Predict2 Image2Image 2B
+PREDICT2_IMAGE2IMAGE_NET_2B = L(MinimalV1LVGDiT)(
+    max_img_h=256,
+    max_img_w=256,
+    max_frames=2,
+    in_channels=16,
+    out_channels=16,
+    patch_spatial=2,
+    patch_temporal=1,
+    concat_padding_mask=True,
+    # attention settings
+    model_channels=2048,
+    num_blocks=28,
+    num_heads=16,
+    atten_backend="minimal_a2a",
+    # positional embedding settings
+    pos_emb_cls="rope3d",
+    pos_emb_learnable=True,
+    pos_emb_interpolation="crop",
+    use_adaln_lora=True,
+    adaln_lora_dim=256,
+    rope_h_extrapolation_ratio=2.0,
+    rope_w_extrapolation_ratio=2.0,
+    rope_t_extrapolation_ratio=1.0,
+    extra_per_block_abs_pos_emb=False,
+    rope_enable_fps_modulation=False,
+    sac_config=L(SACConfig)(
+        every_n_blocks=1,
+        mode="predict2_2b_720",
+    ),
+)
+
+PREDICT2_IMAGE2IMAGE_PIPELINE_2B = Video2WorldPipelineConfig(
+    adjust_video_noise=True,
+    conditioner=L(Vid2VidConditioner)(
+        fps=L(ReMapkey)(
+            dropout_rate=0.0,
+            dtype=None,
+            input_key="fps",
+            output_key="fps",
+        ),
+        padding_mask=L(ReMapkey)(
+            dropout_rate=0.0,
+            dtype=None,
+            input_key="padding_mask",
+            output_key="padding_mask",
+        ),
+        text=L(TextAttr)(
+            dropout_rate=0.2,
+            input_key=["t5_text_embeddings"],
+        ),
+        use_video_condition=L(BooleanFlag)(
+            dropout_rate=0.0,
+            input_key="fps",
+            output_key="use_video_condition",
+        ),
+    ),
+    conditioning_strategy=str(ConditioningStrategy.FRAME_REPLACE),
+    min_num_conditional_frames=1,
+    max_num_conditional_frames=1,
+    net=PREDICT2_IMAGE2IMAGE_NET_2B,
+    precision="bfloat16",
+    rectified_flow_t_scaling_factor=1.0,
+    resize_online=True,
+    resolution="720",
+    ema=L(EMAConfig)(enabled=False),  # defaults to inference
+    sigma_conditional=0.0001,
+    sigma_data=1.0,
+    state_ch=16,
+    state_t=2, #24,
+    text_encoder_class="T5",
+    tokenizer=L(TokenizerInterface)(
+        chunk_duration=2,
+        temporal_window=16,
+        load_mean_std=False,
+        name="tokenizer",
+        vae_pth="checkpoints/nvidia/Cosmos-Predict2-2B-Video2World/tokenizer/tokenizer.pth",
+    ),
+    prompt_refiner_config=CosmosReason1Config(
+        checkpoint_dir="checkpoints/nvidia/Cosmos-Reason1-7B",
+        offload_model_to_cpu=True,
+        enabled=True,
+    ),
+    guardrail_config=CosmosGuardrailConfig(
+        checkpoint_dir="checkpoints/",
+        offload_model_to_cpu=True,
+        enabled=True,
+    ),
+)
+
+class CosmosVideoPredictionModel(LightningModule):
     """
     LightningModule to wrap the Cosmos-Predict2-2B-Video2World model for post-training.
     """
-    def __init__(self, dit_path: str, text_encoder_path: str, learning_rate: float = 1e-5):
+    def __init__(self, dit_path: str, text_encoder_path: str, learning_rate: float):
         super().__init__()
         self.save_hyperparameters()
         self.last_prediction = None
         
         # Load the pre-trained pipeline from config
         self.pipeline = Video2WorldPipeline.from_config(
-            config=PREDICT2_VIDEO2WORLD_PIPELINE_2B,
+            config=PREDICT2_IMAGE2IMAGE_PIPELINE_2B,
             dit_path=dit_path,
             text_encoder_path=text_encoder_path,
-            torch_dtype=torch.bfloat16
+            torch_dtype=torch.bfloat16,
         )
-        
-        # Override config to force 2-frame video processing
-        self.pipeline.config.state_t = self.pipeline.tokenizer.get_latent_num_frames(2)
 
         # Freeze the text encoder's parameters and set it to evaluation mode
         self.pipeline.text_encoder.requires_grad_(False)
         self.pipeline.text_encoder.eval()
 
-        # # Freeze the tokenizer's parameters and set it to evaluation mode
-        # self.pipeline.tokenizer.model.requires_grad_(False)
-        # self.pipeline.tokenizer.model.eval()
+        # Freeze the tokenizer's parameters and set it to evaluation mode
+        self.pipeline.tokenizer.model.model.requires_grad_(False)
+        self.pipeline.tokenizer.model.model.eval()
 
     @torch.no_grad()
     def _full_denoise_step(self, batch: dict) -> torch.Tensor:
@@ -48,13 +158,16 @@ class CosmosVideoPredictionModel(L.LightningModule):
         Returns:
             torch.Tensor: The predicted target frame as a tensor.
         """
-        # prompts = batch['txt']
+        prompts = batch['txt']
         cond_frame = batch['png']
         target_frame = batch['tif']  # Used as a placeholder for shape
         B, _, H, W = cond_frame.shape
 
         # --- 1. Prepare data for the pipeline ---
-        video_placeholder = torch.stack([cond_frame, torch.zeros_like(target_frame)], dim=2)
+        # The VAE tokenizer requires a temporal dimension of at least 3.
+        # We pad the 2-frame input with an additional zero frame.
+        zero_frame = torch.zeros_like(target_frame)
+        video_placeholder = torch.stack([cond_frame, zero_frame], dim=2)
         video = (video_placeholder * 255.0).to(torch.uint8)
         
         # --- 2. Encode prompts for Classifier-Free Guidance (CFG) ---
@@ -113,7 +226,9 @@ class CosmosVideoPredictionModel(L.LightningModule):
         output_latents = x0_fn(sample, sigma_in)
 
         output_video = self.pipeline.decode(output_latents)
-        output_frame = output_video[:, :, -1, :, :]
+
+        # The output_video contains 3 frames; we return the second one, which is our prediction.
+        output_frame = output_video[:, :, 1, :, :]
         return output_frame
 
     def _iter_denoise_step(self, batch: dict):
@@ -124,10 +239,12 @@ class CosmosVideoPredictionModel(L.LightningModule):
         Returns:
             torch.Tensor: The calculated loss for this training step.
         """
+        prompts = batch['txt']
         cond_frame = batch['png']
         target_frame = batch['tif']
 
-        # Create a 2-frame video tensor [cond_frame, target_frame] and prepare for pipeline.
+        # Create a 3-frame video tensor to satisfy the VAE's kernel size.
+        # We pad by repeating the target frame.
         video = torch.stack([cond_frame, target_frame], dim=2)
         video = (video * 255.0).to(torch.uint8)
 
@@ -165,15 +282,8 @@ class CosmosVideoPredictionModel(L.LightningModule):
         sigma = t.view(B, 1)
         x0_pred = x0_fn(xt, sigma)
         
-        # # 6. Calculate the Mean Squared Error loss against the original clean latent.
-        # loss = F.mse_loss(x0_pred, x0)
-
-        # 6. Derive the predicted noise (`eps_pred`) from the predicted clean latent (`x0_pred`).
-        # The relationship is: x0_pred = xt - t * eps_pred  =>  eps_pred = (xt - x0_pred) / t
-        eps_pred = (xt - x0_pred) / t_reshaped
-
-        # 7. Calculate the Mean Squared Error loss against the original noise.
-        loss = F.mse_loss(eps_pred, epsilon)
+        # 6. Calculate the Mean Squared Error loss against the original noise.
+        loss = F.mse_loss(x0_pred, x0)
         
         return loss
 

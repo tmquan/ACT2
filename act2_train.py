@@ -1,5 +1,6 @@
 import lightning as L
 from lightning.pytorch.callbacks import RichProgressBar, ModelCheckpoint
+from lightning.pytorch import seed_everything
 from argparse import ArgumentParser
 
 from act2_model import CosmosVideoPredictionModel
@@ -8,8 +9,7 @@ from act2_datamodule import ACT2DataModule
 
 def main(hparams):
     # --- Configuration ---
-    # IMPORTANT: Change this path to the location of your ACT2 dataset files.
-    data_root = "data/ACT2_raw" 
+    seed_everything(42, workers=True)
     
     # --- DataModule ---
     datamodule = ACT2DataModule(
@@ -44,6 +44,7 @@ def main(hparams):
         devices="auto",
         max_epochs=2000,
         precision="bf16-mixed",
+        deterministic=True,
         callbacks=[image_callback, progress_bar, checkpoint_callback],
         logger=L.pytorch.loggers.TensorBoardLogger("lightning_logs", name="act2_train"),
     )
