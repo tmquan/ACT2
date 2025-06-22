@@ -133,7 +133,7 @@ class CosmosVideoPredictionModel(LightningModule):
         self.save_hyperparameters()
         self.last_prediction = None
         self.loss_reduce = "mean"
-        self.loss_scale = 1.0 # From Predict2Video2WorldModelConfig defaults
+        self.loss_scale = 1e2 # From Predict2Video2WorldModelConfig defaults
         if PREDICT2_IMAGE2IMAGE_PIPELINE_2B.adjust_video_noise:
             self.video_noise_multiplier = math.sqrt(PREDICT2_IMAGE2IMAGE_PIPELINE_2B.state_t)
         else:
@@ -300,11 +300,7 @@ class CosmosVideoPredictionModel(LightningModule):
         
         return loss
 
-    def on_before_optimizer_step(self, optimizer):
-        if self.pipeline.config.ema.enabled:
-            beta = self.ema_beta(self.global_step)
-            self.pipeline.dit_ema_worker.update_average(self.pipeline.dit, self.pipeline.dit_ema, beta=beta)
-
+   
     def draw_training_sigma_and_epsilon(self, x0_size: torch.Size, condition: Any) -> Tuple[torch.Tensor, torch.Tensor]:
         from cosmos_predict2.conditioner import DataType
         batch_size = x0_size[0]
@@ -393,12 +389,17 @@ class CosmosVideoPredictionModel(LightningModule):
         )
         return optimizer
 
-    def ema_beta(self, iteration: int) -> float:
-        """
-        Calculate the beta value for EMA update.
-        weights = weights * beta + (1 - beta) * new_weights
-        """
-        iteration = iteration + self.pipeline.config.ema.iteration_shift
-        if iteration < 1:
-            return 0.0
-        return (1 - 1 / (iteration + 1)) ** (self.pipeline.ema_exp_coefficient + 1) 
+    # def on_before_optimizer_step(self, optimizer):
+    #     if self.pipeline.config.ema.enabled:
+    #         beta = self.ema_beta(self.global_step)
+    #         self.pipeline.dit_ema_worker.update_average(self.pipeline.dit, self.pipeline.dit_ema, beta=beta)
+
+    # def ema_beta(self, iteration: int) -> float:
+    #     """
+    #     Calculate the beta value for EMA update.
+    #     weights = weights * beta + (1 - beta) * new_weights
+    #     """
+    #     iteration = iteration + self.pipeline.config.ema.iteration_shift
+    #     if iteration < 1:
+    #         return 0.0
+    #     return (1 - 1 / (iteration + 1)) ** (self.pipeline.ema_exp_coefficient + 1) 
