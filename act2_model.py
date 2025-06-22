@@ -165,8 +165,15 @@ class CosmosVideoPredictionModel(L.LightningModule):
         sigma = t.view(B, 1)
         x0_pred = x0_fn(xt, sigma)
         
-        # 6. Calculate the Mean Squared Error loss against the original clean latent.
-        loss = F.mse_loss(x0_pred, x0)
+        # # 6. Calculate the Mean Squared Error loss against the original clean latent.
+        # loss = F.mse_loss(x0_pred, x0)
+
+        # 6. Derive the predicted noise (`eps_pred`) from the predicted clean latent (`x0_pred`).
+        # The relationship is: x0_pred = xt - t * eps_pred  =>  eps_pred = (xt - x0_pred) / t
+        eps_pred = (xt - x0_pred) / t_reshaped
+
+        # 7. Calculate the Mean Squared Error loss against the original noise.
+        loss = F.mse_loss(eps_pred, epsilon)
         
         return loss
 
@@ -185,7 +192,7 @@ class CosmosVideoPredictionModel(L.LightningModule):
         loss = self._iter_denoise_step(batch)
         
         # Log the training loss for monitoring.
-        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        self.log('train/loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         
         return loss
     
@@ -208,7 +215,7 @@ class CosmosVideoPredictionModel(L.LightningModule):
         eval_loss = F.l1_loss(predicted_frame, target_frame)
         
         # Log the evalidation/test loss.
-        self.log(f'{stage}_loss', eval_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log(f'{stage}/loss', eval_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
 
     def validation_step(self, batch: dict, batch_idx: int) -> None:
         return self.eval_step(batch, batch_idx, "val")

@@ -75,14 +75,14 @@ class TensorBoardImageCallback(Callback):
             pred_img = (pred_tif.clamp(-1, 1) + 1) / 2
             prompt = batch['txt']
 
-            # Create a grid for comparison
+            # Create a grid for images
             # We want to show input, gt, and prediction for each item in the batch
             # Concatenate along the batch dimension
             grid_tensor = torch.cat([input_img, gt_img, pred_img], dim=3)
             grid = torchvision.utils.make_grid(grid_tensor, nrow=1, padding=0)
             
             logger.add_image(
-                f"{stage}/comparison (Input_GT_Pred)", 
+                f"{stage}/images (Input_GT_Pred)", 
                 grid, 
                 global_step=trainer.current_epoch
             )
