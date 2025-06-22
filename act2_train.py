@@ -3,7 +3,7 @@ from lightning.pytorch.callbacks import RichProgressBar, ModelCheckpoint
 from lightning.pytorch import seed_everything
 from argparse import ArgumentParser
 
-from act2_model import CosmosVideoPredictionModel
+from act2_model import ACT2Model
 from act2_callbacks import TensorBoardImageCallback
 from act2_datamodule import ACT2DataModule
 
@@ -21,7 +21,7 @@ def main(hparams):
     )
 
     # --- Model ---
-    model = CosmosVideoPredictionModel(
+    model = ACT2Model(
         dit_path=hparams.dit_path,
         text_encoder_path=hparams.text_encoder_path,
         learning_rate=hparams.learning_rate
@@ -32,7 +32,7 @@ def main(hparams):
     progress_bar = RichProgressBar()
     checkpoint_callback = ModelCheckpoint(
         dirpath="checkpoints/act2_train",
-        filename="{epoch}-{val/loss:.4f}",
+        filename="{epoch}-{valloss:.4f}",
         save_top_k=3,
         monitor="val/loss",
         mode="min",
