@@ -283,7 +283,7 @@ class CosmosVideoPredictionModel(LightningModule):
         x0_pred = x0_fn(xt, sigma)
         
         # 6. Calculate the Mean Squared Error loss against the original noise.
-        loss = F.mse_loss(x0_pred, x0)
+        loss = F.l1_loss(x0_pred, x0)
         
         return loss
 
@@ -304,7 +304,7 @@ class CosmosVideoPredictionModel(LightningModule):
         # Log the training loss for monitoring.
         self.log('train/loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         
-        return loss
+        return 1e2*loss
     
     def eval_step(self, batch: dict, batch_idx: int, stage: str) -> None:
         """
