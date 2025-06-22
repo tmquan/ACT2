@@ -17,13 +17,14 @@ from monai.transforms import (
     LoadImageDict,
     RandSpatialCropDict,
 )
+from monai.data import CacheDataset
 
 # Set a higher limit for image pixels if dealing with large TIFs
 from PIL import Image
 Image.MAX_IMAGE_PIXELS = None
 
 
-class ACT2Dataset(Dataset):
+class ACT2Dataset(CacheDataset):
     """A PyTorch Dataset for ACT2 data, handling TIF/PNG/TXT triplets."""
     def __init__(self, data: List[Dict], transform: Compose, image_key: str = 'images', hint_key: str = 'hint', txt_key: str = 'txt'):
         self.data = data
