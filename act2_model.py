@@ -163,7 +163,7 @@ class ACT2Model(LightningModule):
         video = torch.stack([cond_frame, target_frame], dim=2)
         video = (video * 255.0).to(torch.uint8)
         B, C, T, H, W = video.shape
-        text_embeddings = self.pipe.encode_prompt(prompts, max_length=64).to(dtype=self.precision)
+        text_embeddings = self.pipe.encode_prompt(prompts).to(dtype=self.precision)
         return {
             "video": video,
             "t5_text_embeddings": text_embeddings,
