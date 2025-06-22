@@ -283,7 +283,14 @@ class CosmosVideoPredictionModel(LightningModule):
         x0_pred = x0_fn(xt, sigma)
         
         # 6. Calculate the Mean Squared Error loss against the original noise.
-        loss = F.l1_loss(x0_pred, x0)
+        # loss = F.l1_loss(x0_pred, x0)
+        # 6. Calculate loss between scheduled noise and predicted noise.
+        # The "scheduled noise" is the original noise, epsilon.
+        # The "predicted noise" is derived from the model's prediction of x0.
+        # From xt = (1-t)*x0 + t*epsilon, we can get epsilon = (xt - (1-t)*x0)/t
+        predicted_noise = (xt - (1 - t_reshaped) * x0_pred) / (t_reshaped + 1e-9)
+        
+        loss = F.mse_loss(predicted_noise, epsilon)
         
         return loss
 
