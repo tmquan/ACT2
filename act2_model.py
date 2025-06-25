@@ -214,9 +214,9 @@ class ACT2Model(LightningModule):
     def training_step(self, batch: dict, batch_idx: int) -> torch.Tensor:
         data_batch = self.process_batch(batch)
         output_batch, loss = self.core_step(data_batch)
-        self.log('train/loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        self.log('train/mse_loss', output_batch['mse_loss'], on_step=True, on_epoch=True, prog_bar=False, logger=True)
-        self.log('train/edm_loss', output_batch['edm_loss'], on_step=True, on_epoch=True, prog_bar=False, logger=True)
+        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        self.log('train_mse_loss', output_batch['mse_loss'], on_step=True, on_epoch=True, prog_bar=False, logger=True)
+        self.log('train_edm_loss', output_batch['edm_loss'], on_step=True, on_epoch=True, prog_bar=False, logger=True)
         if batch_idx == 0:
             self._generate_denoised_image(data_batch)
         return loss
@@ -225,7 +225,7 @@ class ACT2Model(LightningModule):
         data_batch = self.process_batch(batch)
         output_batch, loss = self.core_step(data_batch)
         # Log the evalidation/test loss.
-        self.log(f'val/loss', loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log(f'val_loss', loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
         if batch_idx == 0:
             self._generate_denoised_image(data_batch)
         return loss
@@ -233,7 +233,7 @@ class ACT2Model(LightningModule):
     def test_step(self, batch: dict, batch_idx: int) -> None:
         data_batch = self.process_batch(batch)
         _, loss = self.core_step(data_batch)
-        self.log(f'test/loss', loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log(f'test_loss', loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
         
     def _generate_denoised_image(self, data_batch: dict):
         with torch.no_grad():

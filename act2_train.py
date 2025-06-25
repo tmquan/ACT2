@@ -32,9 +32,9 @@ def main(hparams):
     progress_bar = RichProgressBar()
     checkpoint_callback = ModelCheckpoint(
         dirpath="checkpoints/act2_train",
-        filename="{epoch}-{val/loss:.4f}",
+        filename="{epoch}-{val_loss:.4f}",
         save_top_k=3,
-        monitor="val/loss",
+        monitor="val_loss",
         mode="min",
     )
 
