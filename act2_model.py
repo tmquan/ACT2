@@ -1,6 +1,7 @@
 import torch
 from lightning import LightningModule
 import math
+import random
 
 from cosmos_predict2.models.video2world_model import (
     Predict2Video2WorldModelConfig,
@@ -119,7 +120,7 @@ PREDICT2_IMAGE2IMAGE_PIPELINE_2B = Video2WorldPipelineConfig(
     ),
 )
 
-class ACT2Model(LightningModule):
+class ACT2CosmosPredict2Model(LightningModule):
     def __init__(self, dit_path: str, text_encoder_path: str, learning_rate: float):
         super().__init__()
         self.save_hyperparameters()
@@ -158,6 +159,14 @@ class ACT2Model(LightningModule):
 
     def process_batch(self, batch: dict) -> dict:
         prompts = batch["txt"]
+        if self.training:
+            shuffled_prompts = []
+            for prompt in prompts:
+                words = prompt.split(' ')
+                random.shuffle(words)
+                shuffled_prompts.append(' '.join(words))
+            prompts = shuffled_prompts
+
         cond_frame = batch["png"]
         target_frame = batch["tif"]
         video = torch.stack([cond_frame, target_frame], dim=2)
@@ -188,12 +197,12 @@ class ACT2Model(LightningModule):
     def compute_loss(self, x0, condition, epsilon, sigma) -> tuple[dict, torch.Tensor]:
         mean, std = x0, sigma
         xt = mean + epsilon * rearrange(std, "b t -> b 1 t 1 1")
-        model_pred = self.pipe.denoise(xt, sigma, condition)
+        out_pred = self.pipe.denoise(xt, sigma, condition)
         weights = self.get_per_sigma_loss_weights(sigma=sigma)
-        pred_mse = (x0 - model_pred.x0) ** 2
+        pred_mse = (x0 - out_pred.x0) ** 2
         edm_loss_tensor = pred_mse * rearrange(weights, "b t -> b 1 t 1 1")
         output_batch = {
-            "model_pred": model_pred,
+            "out_pred": out_pred,
             "mse_loss": pred_mse.mean(),
             "edm_loss": edm_loss_tensor.mean(),
         }
