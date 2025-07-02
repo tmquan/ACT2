@@ -211,6 +211,10 @@ class ACT2CosmosPredict2Model(LightningModule):
             self.pipe.text_encoder.requires_grad_(False)
             self.pipe.text_encoder.eval()
 
+            # Ensure tokenizer is on the correct device for distributed training
+            device = next(self.parameters()).device
+            self._ensure_models_on_device(device, move_text_encoder=False, move_tokenizer=True)
+
             # Freeze the tokenizer's parameters and set it to evaluation mode
             self.pipe.tokenizer.model.model.requires_grad_(False)
             self.pipe.tokenizer.model.model.eval()
@@ -219,13 +223,25 @@ class ACT2CosmosPredict2Model(LightningModule):
             self.pipe.denoising_model().requires_grad_(True)
             self.pipe.denoising_model().train()
 
-    def _ensure_text_encoder_on_cpu(self):
-        """Move text encoder to CPU to save GPU memory during training"""
-        if hasattr(self.pipe, 'text_encoder') and self.pipe.text_encoder is not None:
-            self.pipe.text_encoder = self.pipe.text_encoder.to('cpu')
+    def _ensure_models_on_device(self, device='cpu', move_text_encoder=True, move_tokenizer=False):
+        """Manage device placement for text encoder and tokenizer
+        
+        Args:
+            device: Target device (default: 'cpu')
+            move_text_encoder: Whether to move text encoder (default: True)
+            move_tokenizer: Whether to move tokenizer (default: False)
+        """
+        if move_text_encoder and hasattr(self.pipe, 'text_encoder') and self.pipe.text_encoder is not None:
+            self.pipe.text_encoder = self.pipe.text_encoder.to(device)
+        
+        if move_tokenizer and hasattr(self.pipe, 'tokenizer') and hasattr(self.pipe.tokenizer, 'model'):
+            if hasattr(self.pipe.tokenizer.model, 'model'):
+                self.pipe.tokenizer.model.model = self.pipe.tokenizer.model.model.to(device)
 
     def process_batch(self, batch: dict) -> dict:
-        self._ensure_text_encoder_on_cpu()
+        # Keep text encoder on CPU to save GPU memory
+        self._ensure_models_on_device()
+        
         prompts = batch["txt"]
         if self.training:
             shuffled_prompts = []
@@ -240,6 +256,9 @@ class ACT2CosmosPredict2Model(LightningModule):
         target_frame = batch["tif"]
         video = torch.stack([cond_frame, target_frame], dim=2)
         video = (video * 255.0).to(torch.uint8)
+        
+        # Ensure tokenizer is on the same device as the video data
+        self._ensure_models_on_device(video.device, move_text_encoder=False, move_tokenizer=True)
         B, C, T, H, W = video.shape
         # Ensure text embeddings are on the same device as the video tensor
         text_embeddings = self.pipe.encode_prompt(prompts)
@@ -358,6 +377,11 @@ class ACT2CosmosPredict2Model(LightningModule):
         
     def _generate_denoised_image(self, data_batch: dict):
         with torch.no_grad():
+            # Use the device of model parameters for DDP compatibility
+            device = next(self.parameters()).device
+            # Ensure tokenizer is on the correct device
+            self._ensure_models_on_device(device, move_text_encoder=False, move_tokenizer=True)
+            
             x0_fn = self.pipe.get_x0_fn_from_batch(data_batch, guidance=7.0, is_negative_prompt=False)
             _T, _H, _W = data_batch["video"].shape[-3:]
             state_shape = [
@@ -366,8 +390,6 @@ class ACT2CosmosPredict2Model(LightningModule):
                 _H // self.pipe.tokenizer.spatial_compression_factor,
                 _W // self.pipe.tokenizer.spatial_compression_factor,
             ]
-            # Use the device of model parameters for DDP compatibility
-            device = next(self.parameters()).device
             x_sigma_max = misc.arch_invariant_rand(
                 (data_batch["video"].shape[0],) + tuple(state_shape), torch.float32, device, 0
             ) * self.pipe.scheduler.config.sigma_max
