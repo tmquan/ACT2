@@ -29,6 +29,106 @@ from cosmos_predict2.configs.base.config_video2world import (
 from cosmos_predict2.configs.base.defaults.ema import EMAConfig
 from cosmos_predict2.tokenizers.tokenizer import TokenizerInterface
 
+# Try to import kornia for HSV conversion, fallback to pure PyTorch if not available
+try:
+    import kornia
+    KORNIA_AVAILABLE = True
+except ImportError:
+    KORNIA_AVAILABLE = False
+    print("Warning: kornia not available, using pure PyTorch HSV conversion")
+    print("Install kornia with: pip install kornia")
+
+
+def rgb_to_hsv_pytorch_simple(rgb: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """
+    Simple RGB to HSV conversion using pure PyTorch as fallback.
+    rgb: tensor with values in [0, 1]
+    Returns HSV tensor, H in [0, 2π], S and V in [0, 1]
+    """
+    r, g, b = rgb.unbind(dim=-3)
+    
+    max_rgb, argmax_rgb = rgb.max(dim=-3)
+    min_rgb = rgb.min(dim=-3)[0]
+    delta = max_rgb - min_rgb
+    
+    # Hue calculation
+    h = torch.zeros_like(max_rgb)
+    
+    # Avoid division by zero
+    mask = delta > eps
+    
+    # Red is max
+    idx = (argmax_rgb == 0) & mask
+    h[idx] = (60.0 * ((g[idx] - b[idx]) / delta[idx]) + 360.0) % 360.0
+    
+    # Green is max  
+    idx = (argmax_rgb == 1) & mask
+    h[idx] = 60.0 * ((b[idx] - r[idx]) / delta[idx]) + 120.0
+    
+    # Blue is max
+    idx = (argmax_rgb == 2) & mask
+    h[idx] = 60.0 * ((r[idx] - g[idx]) / delta[idx]) + 240.0
+    
+    # Convert to radians (0 to 2π)
+    h = h * math.pi / 180.0
+    
+    # Saturation and Value
+    s = torch.where(max_rgb > eps, delta / max_rgb, torch.zeros_like(max_rgb))
+    v = max_rgb
+    
+    return torch.stack([h, s, v], dim=-3)
+
+
+def compute_hsv_loss(rgb_target: torch.Tensor, rgb_pred: torch.Tensor, 
+                    hue_weight: float = 1.0, sat_weight: float = 1.0, val_weight: float = 1.0) -> torch.Tensor:
+    """
+    Compute HSV domain loss between target and predicted RGB images.
+    Uses kornia.color.rgb_to_hsv if available, fallback to simple PyTorch implementation.
+    
+    Args:
+        rgb_target: Target RGB tensor in [0, 1] range
+        rgb_pred: Predicted RGB tensor in [0, 1] range
+        hue_weight: Weight for hue component loss
+        sat_weight: Weight for saturation component loss  
+        val_weight: Weight for value component loss
+    
+    Returns:
+        Combined HSV loss as scalar tensor
+    """
+    # Ensure values are in [0, 1] range for HSV conversion
+    rgb_target_clamped = torch.clamp(rgb_target, 0.0, 1.0)
+    rgb_pred_clamped = torch.clamp(rgb_pred, 0.0, 1.0)
+    
+    if KORNIA_AVAILABLE:
+        # Use kornia's robust implementation (recommended)
+        hsv_target = kornia.color.rgb_to_hsv(rgb_target_clamped)
+        hsv_pred = kornia.color.rgb_to_hsv(rgb_pred_clamped)
+    else:
+        # Use simple PyTorch fallback
+        hsv_target = rgb_to_hsv_pytorch_simple(rgb_target_clamped)
+        hsv_pred = rgb_to_hsv_pytorch_simple(rgb_pred_clamped)
+    
+    # Extract H, S, V channels
+    h_target, s_target, v_target = hsv_target.unbind(dim=-3)
+    h_pred, s_pred, v_pred = hsv_pred.unbind(dim=-3)
+    
+    # Hue loss (circular distance for proper hue comparison)
+    # Handle the circular nature of hue (0 and 2π are the same)
+    hue_diff = torch.abs(h_target - h_pred)
+    hue_diff = torch.minimum(hue_diff, 2 * math.pi - hue_diff)
+    hue_loss = (hue_diff ** 2).mean()
+    
+    # Saturation and Value losses (standard L2 loss)
+    sat_loss = ((s_target - s_pred) ** 2).mean()
+    val_loss = ((v_target - v_pred) ** 2).mean()
+    
+    # Weighted combination
+    total_hsv_loss = hue_weight * hue_loss \
+                   + sat_weight * sat_loss \
+                   + val_weight * val_loss
+    
+    return total_hsv_loss
+
 
 # Cosmos Predict2 Image2Image 2B
 PREDICT2_IMAGE2IMAGE_NET_2B = LazyCall(MinimalV1LVGDiT)(
@@ -121,7 +221,11 @@ PREDICT2_IMAGE2IMAGE_PIPELINE_2B = Video2WorldPipelineConfig(
 )
 
 class ACT2CosmosPredict2Model(LightningModule):
-    def __init__(self, dit_path: str, text_encoder_path: str, learning_rate: float):
+    def __init__(self, dit_path: str, text_encoder_path: str, learning_rate: float, 
+                 hsv_weight: float = 0.1, 
+                 hue_weight: float = 1.0, 
+                 sat_weight: float = 1.0, 
+                 val_weight: float = 1.0):
         super().__init__()
         self.save_hyperparameters()
 
@@ -139,6 +243,12 @@ class ACT2CosmosPredict2Model(LightningModule):
         self.loss_reduce = "mean"
         self.loss_scale = 10.0
         self.video_noise_multiplier = math.sqrt(2) 
+
+        # HSV loss parameters
+        self.hsv_weight = hsv_weight
+        self.hue_weight = hue_weight
+        self.sat_weight = sat_weight
+        self.val_weight = val_weight
 
         self.last_prediction = None
 
@@ -166,6 +276,7 @@ class ACT2CosmosPredict2Model(LightningModule):
                 random.shuffle(words)
                 shuffled_prompts.append(' '.join(words))
             prompts = shuffled_prompts
+            batch['txt'] = prompts
 
         cond_frame = batch["png"]
         target_frame = batch["tif"]
@@ -194,30 +305,62 @@ class ACT2CosmosPredict2Model(LightningModule):
     def get_per_sigma_loss_weights(self, sigma: torch.Tensor) -> torch.Tensor:
         return (sigma**2 + self.pipe.sigma_data**2) / (sigma * self.pipe.sigma_data) ** 2
 
+    def convert_to_rgb_range(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Convert tensor from [-1, 1] range to [0, 1] range for HSV conversion.
+        """
+        return (x + 1.0) / 2.0
+
     def compute_loss(self, x0, condition, epsilon, sigma) -> tuple[dict, torch.Tensor]:
         mean, std = x0, sigma
         xt = mean + epsilon * rearrange(std, "b t -> b 1 t 1 1")
         out_pred = self.pipe.denoise(xt, sigma, condition)
         weights = self.get_per_sigma_loss_weights(sigma=sigma)
-        pred_mse = (x0 - out_pred.x0) ** 2
-        edm_loss_tensor = pred_mse * rearrange(weights, "b t -> b 1 t 1 1")
+        
+        # Standard RGB MSE loss
+        mse_pred = (x0 - out_pred.x0) ** 2
+        edm_loss = mse_pred * rearrange(weights, "b t -> b 1 t 1 1")
+        
+        # HSV domain loss
+        hsv_loss = torch.tensor(0.0, device=x0.device, dtype=x0.dtype)
+        if self.hsv_weight > 0:
+            try:
+                # Convert from model space to RGB [0, 1] range
+                rgb_dst = self.convert_to_rgb_range(x0)
+                rgb_est = self.convert_to_rgb_range(out_pred.x0)
+                
+                hsv_loss = compute_hsv_loss(
+                    rgb_dst, rgb_est,
+                    hue_weight=self.hue_weight,
+                    sat_weight=self.sat_weight,
+                    val_weight=self.val_weight
+                )
+            except Exception as e:
+                print(f"Warning: HSV loss computation failed: {e}")
+                hsv_loss = torch.tensor(0.0, device=x0.device, dtype=x0.dtype)
+        
         output_batch = {
             "out_pred": out_pred,
-            "mse_loss": pred_mse.mean(),
-            "edm_loss": edm_loss_tensor.mean(),
+            "mse_loss": mse_pred.mean(),
+            "edm_loss": edm_loss.mean(),
+            "hsv_loss": hsv_loss,
         }
-        return output_batch, edm_loss_tensor
+        
+        # Combine losses
+        total_loss = edm_loss + self.hsv_weight * hsv_loss
+        
+        return output_batch, total_loss
 
     def core_step(self, data_batch):
         _, x0, condition = self.pipe.get_data_and_condition(data_batch)
         sigma, epsilon = self.draw_training_sigma_and_epsilon(x0.size(), condition.data_type == DataType.VIDEO)
         x0, condition, epsilon, sigma = self.pipe.broadcast_split_for_model_parallelsim(x0, condition, epsilon, sigma)
-        output, loss_tensor = self.compute_loss(x0, condition, epsilon, sigma)
+        output, loss = self.compute_loss(x0, condition, epsilon, sigma)
         
         if self.loss_reduce == "mean":
-            loss = loss_tensor.mean() * self.loss_scale
+            loss = loss.mean() * self.loss_scale
         else:
-            loss = loss_tensor.sum(dim=1).mean() * self.loss_scale
+            loss = loss.sum(dim=1).mean() * self.loss_scale
         return output, loss
 
     def training_step(self, batch: dict, batch_idx: int) -> torch.Tensor:
@@ -226,6 +369,7 @@ class ACT2CosmosPredict2Model(LightningModule):
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         self.log('train_mse_loss', output_batch['mse_loss'], on_step=True, on_epoch=True, prog_bar=False, logger=True)
         self.log('train_edm_loss', output_batch['edm_loss'], on_step=True, on_epoch=True, prog_bar=False, logger=True)
+        self.log('train_hsv_loss', output_batch['hsv_loss'], on_step=True, on_epoch=True, prog_bar=False, logger=True)
         if batch_idx == 0:
             self._generate_denoised_image(data_batch)
         return loss
@@ -233,8 +377,9 @@ class ACT2CosmosPredict2Model(LightningModule):
     def validation_step(self, batch: dict, batch_idx: int) -> None:
         data_batch = self.process_batch(batch)
         output_batch, loss = self.core_step(data_batch)
-        # Log the evalidation/test loss.
+        # Log the validation/test loss.
         self.log(f'val_loss', loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log(f'val_hsv_loss', output_batch['hsv_loss'], on_step=False, on_epoch=True, prog_bar=False, logger=True)
         if batch_idx == 0:
             self._generate_denoised_image(data_batch)
         return loss
