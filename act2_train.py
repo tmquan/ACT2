@@ -46,7 +46,7 @@ def main(hparams):
         accelerator="gpu",
         devices=-1,  # Use all available GPUs
         strategy="ddp",  # Standard Distributed Data Parallel
-        max_epochs=2000,
+        max_epochs=500,
         precision="bf16-mixed",
         deterministic=True,
         sync_batchnorm=True,  # Synchronize batch normalization across GPUs
