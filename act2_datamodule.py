@@ -1,6 +1,7 @@
 # act2_datamodule.py
 import os
 import glob
+import random
 from typing import List, Optional, Dict
 
 import torch
@@ -26,15 +27,18 @@ Image.MAX_IMAGE_PIXELS = None
 
 class ACT2Dataset(CacheDataset):
     """A PyTorch Dataset for ACT2 data, handling TIF/PNG/TXT triplets."""
-    def __init__(self, data: List[Dict], transform: Compose, image_key: str = 'images', hint_key: str = 'hint', txt_key: str = 'txt'):
+    def __init__(self, data: List[Dict], transform: Compose, image_key: str = 'images', hint_key: str = 'hint', txt_key: str = 'txt', num_samples: Optional[int] = None):
         self.data = data
         self.transform = transform
         self.image_key = image_key
         self.hint_key = hint_key
         self.txt_key = txt_key
+        self.num_samples = num_samples
 
 
     def __len__(self):
+        if self.num_samples is not None:
+            return self.num_samples
         return len(self.data)
 
     def __getitem__(self, index: int) -> Dict[str, any]:
@@ -43,6 +47,10 @@ class ACT2Dataset(CacheDataset):
         The sample dictionary keys are determined by the MONAI pipeline,
         and we map them to what the model expects ('hint', 'images', 'txt').
         """
+        if self.num_samples is not None:
+            # Randomly pick an index from the actual data when num_samples is set
+            index = random.randint(0, len(self.data) - 1)
+        
         sample = self.data[index]
         
         # Read text content from the txt file
@@ -82,6 +90,9 @@ class ACT2DataModule(LightningDataModule):
         num_workers: int = 8,
         pin_memory: bool = True,
         persistent_workers: bool = True,
+        train_samples: Optional[int] = None,
+        val_samples: Optional[int] = None,
+        test_samples: Optional[int] = None,
     ):
         """
         Initializes the DataModule.
@@ -95,6 +106,9 @@ class ACT2DataModule(LightningDataModule):
             num_workers (int): Number of workers for the DataLoader.
             pin_memory (bool): Whether to use pinned memory.
             persistent_workers (bool): Whether to keep worker processes alive.
+            train_samples (Optional[int]): Number of training samples per epoch. If None, uses all available data.
+            val_samples (Optional[int]): Number of validation samples per epoch. If None, uses all available data.
+            test_samples (Optional[int]): Number of test samples per epoch. If None, uses all available data.
         """
         super().__init__()
         self.root_folder = root_folder
@@ -105,6 +119,9 @@ class ACT2DataModule(LightningDataModule):
         self.num_workers = num_workers
         self.pin_memory = pin_memory
         self.persistent_workers = persistent_workers
+        self.train_samples = train_samples
+        self.val_samples = val_samples
+        self.test_samples = test_samples
 
         # Define MONAI transforms
         self.train_transforms = Compose([
@@ -175,7 +192,7 @@ class ACT2DataModule(LightningDataModule):
                 elif 'Subject2' in base_name or 'Subject4' in base_name:
                     self.train_tuples.append(sample)
         
-        print(f"Found {len(file_groups)} unique file base names.")
+        print(f"Curated {len(file_groups)} unique file base names.")
         print(f"Created {len(self.train_tuples)} training, {len(self.val_tuples)} val, and {len(self.test_tuples)} test samples.")
 
     def setup(self, stage: Optional[str] = None):
@@ -188,14 +205,16 @@ class ACT2DataModule(LightningDataModule):
                 self.train_transforms, 
                 image_key='tif', 
                 hint_key='png', 
-                txt_key='txt'
+                txt_key='txt',
+                num_samples=self.train_samples
             )
             self._val_ds = ACT2Dataset(
                 self.val_tuples, 
                 self.val_transforms, 
                 image_key='tif', 
                 hint_key='png', 
-                txt_key='txt'
+                txt_key='txt',
+                num_samples=self.val_samples
             )
         
         if stage == 'test' or stage is None:
@@ -204,15 +223,16 @@ class ACT2DataModule(LightningDataModule):
                 self.val_transforms,
                 image_key='tif', 
                 hint_key='png', 
-                txt_key='txt'
+                txt_key='txt',
+                num_samples=self.test_samples
             )
 
-    def _create_dataloader(self, dataset: Dataset, shuffle: bool = False) -> DataLoader:
+    def _create_dataloader(self, dataset: Dataset, shuffle: bool = False, num_workers: Optional[int] = None) -> DataLoader:
         """Creates a DataLoader for a given Dataset instance."""
         return DataLoader(
             dataset,
             batch_size=self.micro_batch_size,
-            num_workers=self.num_workers,
+            num_workers=num_workers if num_workers is not None else self.num_workers,
             pin_memory=self.pin_memory,
             persistent_workers=self.persistent_workers,
             shuffle=shuffle,
@@ -220,15 +240,15 @@ class ACT2DataModule(LightningDataModule):
 
     def train_dataloader(self) -> DataLoader:
         """Returns the training DataLoader."""
-        return self._create_dataloader(self._train_ds, shuffle=True)
+        return self._create_dataloader(self._train_ds, num_workers=32, shuffle=True)
 
     def val_dataloader(self) -> DataLoader:
         """Returns the val DataLoader."""
-        return self._create_dataloader(self._val_ds)
+        return self._create_dataloader(self._val_ds, num_workers=4)
 
     def test_dataloader(self) -> DataLoader:
         """Returns the testing DataLoader."""
-        return self._create_dataloader(self._test_ds)
+        return self._create_dataloader(self._test_ds, num_workers=4)
 
 def main():
     """Main function to test and verify the ACT2DataModule."""
@@ -257,7 +277,9 @@ def main():
         image_W=512,
         micro_batch_size=2,
         global_batch_size=4,
-        num_workers=2,
+        train_samples=10000,
+        val_samples=400,
+        test_samples=400,
     )
     
     # Setup datasets

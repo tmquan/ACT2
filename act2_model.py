@@ -78,58 +78,6 @@ def rgb_to_hsv_pytorch_simple(rgb: torch.Tensor, eps: float = 1e-8) -> torch.Ten
     
     return torch.stack([h, s, v], dim=-3)
 
-
-def compute_hsv_loss(rgb_target: torch.Tensor, rgb_pred: torch.Tensor, 
-                    hue_weight: float = 1.0, sat_weight: float = 1.0, val_weight: float = 1.0) -> torch.Tensor:
-    """
-    Compute HSV domain loss between target and predicted RGB images.
-    Uses kornia.color.rgb_to_hsv if available, fallback to simple PyTorch implementation.
-    
-    Args:
-        rgb_target: Target RGB tensor in [0, 1] range
-        rgb_pred: Predicted RGB tensor in [0, 1] range
-        hue_weight: Weight for hue component loss
-        sat_weight: Weight for saturation component loss  
-        val_weight: Weight for value component loss
-    
-    Returns:
-        Combined HSV loss as scalar tensor
-    """
-    # Ensure values are in [0, 1] range for HSV conversion
-    rgb_target_clamped = torch.clamp(rgb_target, 0.0, 1.0)
-    rgb_pred_clamped = torch.clamp(rgb_pred, 0.0, 1.0)
-    
-    if KORNIA_AVAILABLE:
-        # Use kornia's robust implementation (recommended)
-        hsv_target = kornia.color.rgb_to_hsv(rgb_target_clamped)
-        hsv_pred = kornia.color.rgb_to_hsv(rgb_pred_clamped)
-    else:
-        # Use simple PyTorch fallback
-        hsv_target = rgb_to_hsv_pytorch_simple(rgb_target_clamped)
-        hsv_pred = rgb_to_hsv_pytorch_simple(rgb_pred_clamped)
-    
-    # Extract H, S, V channels
-    h_target, s_target, v_target = hsv_target.unbind(dim=-3)
-    h_pred, s_pred, v_pred = hsv_pred.unbind(dim=-3)
-    
-    # Hue loss (circular distance for proper hue comparison)
-    # Handle the circular nature of hue (0 and 2π are the same)
-    hue_diff = torch.abs(h_target - h_pred)
-    hue_diff = torch.minimum(hue_diff, 2 * math.pi - hue_diff)
-    hue_loss = (hue_diff ** 2).mean()
-    
-    # Saturation and Value losses (standard L2 loss)
-    sat_loss = ((s_target - s_pred) ** 2).mean()
-    val_loss = ((v_target - v_pred) ** 2).mean()
-    
-    # Weighted combination
-    total_hsv_loss = hue_weight * hue_loss \
-                   + sat_weight * sat_loss \
-                   + val_weight * val_loss
-    
-    return total_hsv_loss
-
-
 # Cosmos Predict2 Image2Image 2B
 PREDICT2_IMAGE2IMAGE_NET_2B = LazyCall(MinimalV1LVGDiT)(
     max_img_h=256,
@@ -240,6 +188,10 @@ class ACT2CosmosPredict2Model(LightningModule):
             state_dict_dit_compatible = {k.replace("net.", ""): v for k, v in state_dict.items() if k.startswith("net.")}
             self.pipe.dit.load_state_dict(state_dict_dit_compatible, strict=False)
 
+        self.pipe.text_encoder = CosmosT5TextEncoder(device="cpu", cache_dir=self.hparams.text_encoder_path)
+        self.pipe.text_encoder.requires_grad_(False)
+        self.pipe.text_encoder.eval()
+
         self.loss_reduce = "mean"
         self.loss_scale = 10.0
         self.video_noise_multiplier = math.sqrt(2) 
@@ -254,8 +206,8 @@ class ACT2CosmosPredict2Model(LightningModule):
 
     def setup(self, stage: str):
         if stage == "fit":
-            self.pipe.text_encoder = CosmosT5TextEncoder(device=self.device, cache_dir=self.hparams.text_encoder_path)
-            # Freeze the text encoder's parameters and set it to evaluation mode
+            # Create text encoder on CPU and keep it there to save GPU memory
+            self.pipe.text_encoder = CosmosT5TextEncoder(device="cpu", cache_dir=self.hparams.text_encoder_path)
             self.pipe.text_encoder.requires_grad_(False)
             self.pipe.text_encoder.eval()
 
@@ -267,7 +219,13 @@ class ACT2CosmosPredict2Model(LightningModule):
             self.pipe.denoising_model().requires_grad_(True)
             self.pipe.denoising_model().train()
 
+    def _ensure_text_encoder_on_cpu(self):
+        """Move text encoder to CPU to save GPU memory during training"""
+        if hasattr(self.pipe, 'text_encoder') and self.pipe.text_encoder is not None:
+            self.pipe.text_encoder = self.pipe.text_encoder.to('cpu')
+
     def process_batch(self, batch: dict) -> dict:
+        self._ensure_text_encoder_on_cpu()
         prompts = batch["txt"]
         if self.training:
             shuffled_prompts = []
@@ -283,7 +241,9 @@ class ACT2CosmosPredict2Model(LightningModule):
         video = torch.stack([cond_frame, target_frame], dim=2)
         video = (video * 255.0).to(torch.uint8)
         B, C, T, H, W = video.shape
-        text_embeddings = self.pipe.encode_prompt(prompts).to(dtype=self.precision)
+        # Ensure text embeddings are on the same device as the video tensor
+        text_embeddings = self.pipe.encode_prompt(prompts)
+        text_embeddings = text_embeddings.to(dtype=self.precision, device=video.device)
         return {
             "video": video,
             "t5_text_embeddings": text_embeddings,
@@ -295,8 +255,10 @@ class ACT2CosmosPredict2Model(LightningModule):
 
     def draw_training_sigma_and_epsilon(self, x0_size: torch.Size, is_video_batch: bool) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size = x0_size[0]
-        epsilon = torch.randn(x0_size, device=self.device)
-        sigma_B = self.pipe.scheduler.sample_sigma(batch_size).to(device=self.device)
+        # Use the device of the input tensor instead of self.device for DDP compatibility
+        device = next(self.parameters()).device
+        epsilon = torch.randn(x0_size, device=device)
+        sigma_B = self.pipe.scheduler.sample_sigma(batch_size).to(device=device)
         sigma_B_1 = rearrange(sigma_B, "b -> b 1")
         multiplier = self.video_noise_multiplier if is_video_batch else 1
         sigma_B_1 = sigma_B_1 * multiplier
@@ -326,15 +288,19 @@ class ACT2CosmosPredict2Model(LightningModule):
         if self.hsv_weight > 0:
             try:
                 # Convert from model space to RGB [0, 1] range
-                rgb_dst = self.convert_to_rgb_range(x0)
-                rgb_est = self.convert_to_rgb_range(out_pred.x0)
+                rgb_true = self.convert_to_rgb_range(x0)
+                rgb_pred = self.convert_to_rgb_range(out_pred.x0)
                 
-                hsv_loss = compute_hsv_loss(
-                    rgb_dst, rgb_est,
-                    hue_weight=self.hue_weight,
-                    sat_weight=self.sat_weight,
-                    val_weight=self.val_weight
-                )
+                # Convert to HSV space
+                if KORNIA_AVAILABLE:
+                    hsv_true = kornia.color.rgb_to_hsv(rgb_true)
+                    hsv_pred = kornia.color.rgb_to_hsv(rgb_pred)
+                else:
+                    hsv_true = rgb_to_hsv_pytorch_simple(rgb_true)
+                    hsv_pred = rgb_to_hsv_pytorch_simple(rgb_pred)
+                
+                # Simple MSE loss in HSV space
+                hsv_loss = ((hsv_true - hsv_pred) ** 2)
             except Exception as e:
                 print(f"Warning: HSV loss computation failed: {e}")
                 hsv_loss = torch.tensor(0.0, device=x0.device, dtype=x0.dtype)
@@ -343,13 +309,14 @@ class ACT2CosmosPredict2Model(LightningModule):
             "out_pred": out_pred,
             "mse_loss": mse_pred.mean(),
             "edm_loss": edm_loss.mean(),
-            "hsv_loss": hsv_loss,
+            "hsv_loss": hsv_loss.mean(),
         }
         
-        # Combine losses
-        total_loss = edm_loss + self.hsv_weight * hsv_loss
+        # Combine losses - ensure both are on the same device
+        hsv_loss = hsv_loss.to(device=edm_loss.device)
+        ret_loss = edm_loss + self.hsv_weight * hsv_loss
         
-        return output_batch, total_loss
+        return output_batch, ret_loss
 
     def core_step(self, data_batch):
         _, x0, condition = self.pipe.get_data_and_condition(data_batch)
@@ -399,8 +366,10 @@ class ACT2CosmosPredict2Model(LightningModule):
                 _H // self.pipe.tokenizer.spatial_compression_factor,
                 _W // self.pipe.tokenizer.spatial_compression_factor,
             ]
+            # Use the device of model parameters for DDP compatibility
+            device = next(self.parameters()).device
             x_sigma_max = misc.arch_invariant_rand(
-                (data_batch["video"].shape[0],) + tuple(state_shape), torch.float32, self.device, 0
+                (data_batch["video"].shape[0],) + tuple(state_shape), torch.float32, device, 0
             ) * self.pipe.scheduler.config.sigma_max
             
             scheduler = self.pipe.scheduler

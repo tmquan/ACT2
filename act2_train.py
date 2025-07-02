@@ -17,7 +17,9 @@ def main(hparams):
         image_H=512,
         image_W=512,
         micro_batch_size=4,
-        num_workers=24,
+        train_samples=10000,
+        val_samples=400,
+        test_samples=400,
     )
 
     # --- Model ---
@@ -41,11 +43,13 @@ def main(hparams):
 
     # --- Trainer ---
     trainer = L.Trainer(
-        accelerator="auto",
-        devices="auto",
+        accelerator="gpu",
+        devices=-1,  # Use all available GPUs
+        strategy="ddp",  # Standard Distributed Data Parallel
         max_epochs=2000,
         precision="bf16-mixed",
         deterministic=True,
+        sync_batchnorm=True,  # Synchronize batch normalization across GPUs
         callbacks=[image_callback, progress_bar, checkpoint_callback],
         logger=L.pytorch.loggers.TensorBoardLogger("lightning_logs", name="act2_train"),
     )
