@@ -277,7 +277,7 @@ def main():
         image_W=512,
         micro_batch_size=2,
         global_batch_size=4,
-        train_samples=10000,
+        train_samples=2000,
         val_samples=400,
         test_samples=400,
     )

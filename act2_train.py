@@ -17,7 +17,7 @@ def main(hparams):
         image_H=512,
         image_W=512,
         micro_batch_size=4,
-        train_samples=10000,
+        train_samples=2000,
         val_samples=400,
         test_samples=400,
     )
@@ -35,21 +35,19 @@ def main(hparams):
     checkpoint_callback = ModelCheckpoint(
         dirpath="checkpoints/act2_train",
         filename="{epoch}-{val_loss:.4f}",
-        save_top_k=5,
+        save_top_k=3,
+        save_last=True,
         monitor="val_loss",
         mode="min",
-        save_last=True,
     )
 
     # --- Trainer ---
     trainer = L.Trainer(
-        accelerator="gpu",
-        devices=-1,  # Use all available GPUs
-        strategy="ddp",  # Standard Distributed Data Parallel
+        accelerator="auto",
+        devices="auto",
         max_epochs=500,
         precision="bf16-mixed",
         deterministic=True,
-        sync_batchnorm=True,  # Synchronize batch normalization across GPUs
         callbacks=[image_callback, progress_bar, checkpoint_callback],
         logger=L.pytorch.loggers.TensorBoardLogger("lightning_logs", name="act2_train"),
     )
