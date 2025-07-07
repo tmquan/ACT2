@@ -1,6 +1,9 @@
 import math
 import random
 import torch
+import hashlib
+from typing import Dict, List, Tuple
+from collections import OrderedDict
 
 from lightning import LightningModule
 
@@ -124,7 +127,11 @@ class ACT2CosmosPredict2Model(LightningModule):
     def __init__(self, 
         dit_path: str, 
         text_encoder_path: str, 
-        learning_rate: float
+        learning_rate: float,
+        max_cache_mem_size: int = 10000,  # Maximum number of cached embeddings
+        enable_text_cache: bool = True,
+        cache_on_gpu: bool = True,  # Store embeddings on GPU for faster access
+        gpu_cache_memory_limit_mb: int = 8192,  # GPU memory limit for cache in MB
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -145,6 +152,186 @@ class ACT2CosmosPredict2Model(LightningModule):
         self.video_noise_multiplier = math.sqrt(2) 
 
         self.last_prediction = None
+        
+        # Text embedding cache for performance optimization (FIFO)
+        self.enable_text_cache = enable_text_cache
+        self.max_cache_mem_size = max_cache_mem_size
+        self.cache_on_gpu = cache_on_gpu
+        self.gpu_cache_memory_limit_mb = gpu_cache_memory_limit_mb
+        self.text_embedding_cache: OrderedDict[str, torch.Tensor] = OrderedDict()
+        self.cache_hit_count = 0
+        self.cache_miss_count = 0
+        self.cache_memory_usage_mb = 0.0
+        
+        print(f"Text embedding cache enabled: {self.enable_text_cache}")
+        if self.enable_text_cache:
+            print(f"Maximum cache size: {self.max_cache_mem_size}")
+            print(f"Cache storage: {'GPU' if self.cache_on_gpu else 'CPU'} memory")
+            print(f"Cache policy: FIFO (First In, First Out)")
+            if self.cache_on_gpu:
+                print(f"GPU cache memory limit: {self.gpu_cache_memory_limit_mb} MB")
+
+    def _get_prompt_hash(self, prompt: str) -> str:
+        """Generate a hash for a prompt to use as cache key."""
+        return hashlib.md5(prompt.encode('utf-8')).hexdigest()
+
+    def _estimate_tensor_memory_mb(self, tensor: torch.Tensor) -> float:
+        """Estimate tensor memory usage in MB."""
+        return tensor.numel() * tensor.element_size() / (1024 * 1024)
+
+    def _clean_cache_by_memory_limit(self):
+        """Clean cache using FIFO policy when memory limit is exceeded - remove one oldest item."""
+        if not self.cache_on_gpu or self.cache_memory_usage_mb <= self.gpu_cache_memory_limit_mb:
+            return
+        
+        if len(self.text_embedding_cache) > 0:
+            # Remove exactly one oldest entry (FIFO)
+            key, tensor = self.text_embedding_cache.popitem(last=False)
+            freed_memory = self._estimate_tensor_memory_mb(tensor)
+            self.cache_memory_usage_mb -= freed_memory
+            print(f"FIFO cache cleanup: Removed 1 oldest entry, freed {freed_memory:.2f} MB")
+
+    def _get_cached_text_embeddings(self, prompts: List[str]) -> Tuple[torch.Tensor, List[str]]:
+        """
+        Get cached text embeddings for prompts, returning embeddings and list of uncached prompts.
+        Updates access order for FIFO management.
+        """
+        if not self.enable_text_cache:
+            return None, prompts
+        
+        batch_size = len(prompts)
+        cached_embeddings = []
+        uncached_prompts = []
+        uncached_indices = []
+        
+        for i, prompt in enumerate(prompts):
+            prompt_hash = self._get_prompt_hash(prompt)
+            if prompt_hash in self.text_embedding_cache:
+                # Move to end to update access order (most recently used)
+                cached_embedding = self.text_embedding_cache.pop(prompt_hash)
+                self.text_embedding_cache[prompt_hash] = cached_embedding
+                
+                # Move to correct device and dtype if needed
+                if self.cache_on_gpu:
+                    # Already on GPU, just ensure correct dtype
+                    cached_embedding = cached_embedding.to(dtype=self.precision)
+                else:
+                    # Move from CPU to GPU
+                    cached_embedding = cached_embedding.to(device=self.device, dtype=self.precision)
+                
+                cached_embeddings.append(cached_embedding)
+                self.cache_hit_count += 1
+            else:
+                uncached_prompts.append(prompt)
+                uncached_indices.append(i)
+                cached_embeddings.append(None)
+                self.cache_miss_count += 1
+        
+        # If all prompts are cached, return the cached embeddings
+        if not uncached_prompts:
+            final_embeddings = torch.stack([emb for emb in cached_embeddings])
+            return final_embeddings, []
+        
+        # If some prompts are cached, we'll need to encode the uncached ones
+        return cached_embeddings, uncached_prompts
+
+    def _cache_text_embeddings(self, prompts: List[str], embeddings: torch.Tensor):
+        """Cache text embeddings using FIFO policy - remove oldest when full."""
+        if not self.enable_text_cache:
+            return
+        
+        # Cache the new embeddings (will be added at the end, making them newest)
+        for prompt, embedding in zip(prompts, embeddings):
+            prompt_hash = self._get_prompt_hash(prompt)
+            
+            # Remove oldest item if cache is at capacity
+            if len(self.text_embedding_cache) >= self.max_cache_mem_size:
+                # Remove exactly one oldest entry (FIFO)
+                removed_key, removed_tensor = self.text_embedding_cache.popitem(last=False)
+                if self.cache_on_gpu:
+                    self.cache_memory_usage_mb -= self._estimate_tensor_memory_mb(removed_tensor)
+                print(f"FIFO text cache: Removed oldest entry to make space")
+            
+            if self.cache_on_gpu:
+                # Store on GPU for faster access
+                cached_embedding = embedding.detach().to(dtype=self.precision)
+                # Update memory usage tracking
+                self.cache_memory_usage_mb += self._estimate_tensor_memory_mb(cached_embedding)
+            else:
+                # Store on CPU to save GPU memory
+                cached_embedding = embedding.detach().cpu()
+            
+            # Add new entry (becomes the newest in FIFO order)
+            self.text_embedding_cache[prompt_hash] = cached_embedding
+            
+            # If GPU memory limit is exceeded after adding, remove one oldest item
+            if self.cache_on_gpu and self.cache_memory_usage_mb > self.gpu_cache_memory_limit_mb:
+                self._clean_cache_by_memory_limit()
+
+    def _encode_prompts_with_cache(self, prompts: List[str]) -> torch.Tensor:
+        """
+        Encode prompts using cache when possible.
+        """
+        if not self.enable_text_cache:
+            # No caching, encode all prompts
+            return self.pipe.encode_prompt(prompts).to(dtype=self.precision)
+        
+        # Try to get cached embeddings
+        cached_result, uncached_prompts = self._get_cached_text_embeddings(prompts)
+        
+        if isinstance(cached_result, torch.Tensor):
+            # All prompts were cached
+            return cached_result
+        
+        # Some prompts need to be encoded
+        if uncached_prompts:
+            # Encode uncached prompts
+            new_embeddings = self.pipe.encode_prompt(uncached_prompts).to(dtype=self.precision)
+            
+            # Cache the new embeddings
+            self._cache_text_embeddings(uncached_prompts, new_embeddings)
+            
+            # Reconstruct the full batch
+            final_embeddings = []
+            uncached_idx = 0
+            
+            for i, prompt in enumerate(prompts):
+                if cached_result[i] is not None:
+                    # Use cached embedding
+                    final_embeddings.append(cached_result[i])
+                else:
+                    # Use newly encoded embedding
+                    final_embeddings.append(new_embeddings[uncached_idx])
+                    uncached_idx += 1
+            
+            return torch.stack(final_embeddings)
+        else:
+            # This shouldn't happen, but handle it gracefully
+            return self.pipe.encode_prompt(prompts).to(dtype=self.precision)
+
+    def get_cache_stats(self) -> Dict[str, any]:
+        """Get cache statistics for monitoring."""
+        total_requests = self.cache_hit_count + self.cache_miss_count
+        hit_rate = (self.cache_hit_count / total_requests * 100) if total_requests > 0 else 0
+        
+        # Get current GPU memory usage if available
+        gpu_memory_used_mb = 0.0
+        gpu_memory_total_mb = 0.0
+        if torch.cuda.is_available() and self.device.type == 'cuda':
+            gpu_memory_used_mb = torch.cuda.memory_allocated(self.device) / (1024 * 1024)
+            gpu_memory_total_mb = torch.cuda.memory_reserved(self.device) / (1024 * 1024)
+        
+        return {
+            "cache_mem_size": len(self.text_embedding_cache),
+            "cache_hits": self.cache_hit_count,
+            "cache_misses": self.cache_miss_count,
+            "hit_rate_percent": hit_rate,
+            "total_requests": total_requests,
+            "cache_memory_mb": self.cache_memory_usage_mb if self.cache_on_gpu else 0.0,
+            "gpu_memory_used_mb": gpu_memory_used_mb,
+            "gpu_memory_total_mb": gpu_memory_total_mb,
+            "cache_storage": "GPU" if self.cache_on_gpu else "CPU"
+        }
 
     def setup(self, stage: str):
         if stage == "fit":
@@ -178,7 +365,10 @@ class ACT2CosmosPredict2Model(LightningModule):
         video = torch.stack([cond_frame, target_frame], dim=2)
         video = (video * 255.0).to(torch.uint8)
         B, C, T, H, W = video.shape
-        text_embeddings = self.pipe.encode_prompt(prompts).to(dtype=self.precision)
+        
+        # Use cached text embeddings for better performance
+        text_embeddings = self._encode_prompts_with_cache(prompts)
+        
         return {
             "video": video,
             "t5_text_embeddings": text_embeddings,
@@ -237,6 +427,16 @@ class ACT2CosmosPredict2Model(LightningModule):
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         self.log('train_mse_loss', output_batch['mse_loss'], on_step=True, on_epoch=True, prog_bar=False, logger=True)
         self.log('train_edm_loss', output_batch['edm_loss'], on_step=True, on_epoch=True, prog_bar=False, logger=True)
+        
+        # Log cache statistics every 100 steps
+        if batch_idx % 100 == 0 and self.enable_text_cache:
+            cache_stats = self.get_cache_stats()
+            self.log('cache_hit_rate', cache_stats['hit_rate_percent'], on_step=True, on_epoch=False, prog_bar=False, logger=True)
+            self.log('cache_mem_size', cache_stats['cache_mem_size'], on_step=True, on_epoch=False, prog_bar=False, logger=True)
+            if self.cache_on_gpu:
+                self.log('cache_memory_mb', cache_stats['cache_memory_mb'], on_step=True, on_epoch=False, prog_bar=False, logger=True)
+                self.log('gpu_memory_used_mb', cache_stats['gpu_memory_used_mb'], on_step=True, on_epoch=False, prog_bar=False, logger=True)
+        
         if batch_idx == 0:
             self._generate_denoised_image(data_batch)
         return loss
@@ -287,5 +487,22 @@ class ACT2CosmosPredict2Model(LightningModule):
     def configure_optimizers(self):
         trainable_params = [p for p in self.pipe.parameters() if p.requires_grad]
         return torch.optim.AdamW(trainable_params, lr=self.hparams.learning_rate)
+    
+    def on_train_epoch_end(self):
+        """Print cache statistics at the end of each epoch."""
+        if self.enable_text_cache:
+            cache_stats = self.get_cache_stats()
+            print(f"\n=== Text Embedding Cache Stats (Epoch {self.current_epoch}) ===")
+            print(f"Cache size: {cache_stats['cache_mem_size']}/{self.max_cache_mem_size}")
+            print(f"Hit rate: {cache_stats['hit_rate_percent']:.1f}%")
+            print(f"Total requests: {cache_stats['total_requests']}")
+            print(f"Cache hits: {cache_stats['cache_hits']}")
+            print(f"Cache misses: {cache_stats['cache_misses']}")
+            print(f"Cache storage: {cache_stats['cache_storage']}")
+            if self.cache_on_gpu:
+                print(f"Cache memory usage: {cache_stats['cache_memory_mb']:.2f} MB")
+                print(f"GPU memory used: {cache_stats['gpu_memory_used_mb']:.2f} MB")
+                print(f"GPU memory total: {cache_stats['gpu_memory_total_mb']:.2f} MB")
+            print("="*50)
     
     

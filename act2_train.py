@@ -17,9 +17,15 @@ def main(hparams):
         image_H=512,
         image_W=512,
         micro_batch_size=4,
-        train_samples=2000,
-        val_samples=400,
-        test_samples=400,
+        train_samples=4000,
+        val_samples=800,
+        test_samples=800,
+        num_workers=64,
+        pin_memory=True,
+        persistent_workers=True,
+        cache_rate=1.0,
+        use_thread_dataloader=True,
+        prefetch_factor=16,
     )
 
     # --- Model ---
@@ -45,7 +51,7 @@ def main(hparams):
     trainer = L.Trainer(
         accelerator="auto",
         devices="auto",
-        max_epochs=500,
+        max_epochs=300,
         precision="bf16-mixed",
         deterministic=True,
         callbacks=[image_callback, progress_bar, checkpoint_callback],
