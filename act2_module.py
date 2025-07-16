@@ -291,8 +291,8 @@ class ACT2CosmosPredict2Module(LightningModule):
     def _process_batch(self, batch: dict) -> dict:
         """Process input batch and prepare for training/inference."""
         prompts = batch["txt"]
-        cond_frame = batch["png"]
-        true_frame = batch["tif"]
+        cond_frame = batch["tif"]
+        true_frame = batch["png"]
         _device = cond_frame.device
         
         if self.training:

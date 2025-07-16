@@ -63,8 +63,8 @@ class TensorBoardImageCallback(Callback):
             logger = trainer.logger.experiment
             
             # Get full batches for logging
-            orig_batch = batch['png']  # Shape: (B, C, H, W)
-            true_batch = batch['tif']     # Shape: (B, C, H, W)
+            orig_batch = batch['tif']   # Shape: (B, C, H, W)
+            true_batch = batch['png']   # Shape: (B, C, H, W)
             
             # The model prediction is already the single predicted frame.
             pred_tif = pred_vid
@@ -82,7 +82,7 @@ class TensorBoardImageCallback(Callback):
             grid = torchvision.utils.make_grid(grid_tensor, nrow=1, padding=0)
             
             logger.add_image(
-                f"{stage}/images (Input_true_Pred)", 
+                f"{stage}/images (Input_True_Pred)", 
                 grid, 
                 global_step=trainer.current_epoch
             )
