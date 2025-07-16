@@ -83,7 +83,7 @@ if __name__ == "__main__":
     parser.add_argument("--text_encoder_path", type=str, help="Path to the text encoder model.",
                         default="checkpoints/google-t5/t5-11b")
     parser.add_argument("--hsv_weight", type=float, default=0.1, help="Weight for HSV loss.")
-    parser.add_argument("--img_weight", type=float, default=0.1, help="Weight for image loss.")
+    parser.add_argument("--img_weight", type=float, default=0.1, help="Weight for IMG loss.")
     
     # Add cache-specific arguments
     parser.add_argument("--cache_size", type=int, default=1000, help="Size of text embedding cache.")
