@@ -511,38 +511,47 @@ class ACT2CosmosPredict2Module(LightningModule):
         mse_loss = (x0 - out_pred.x0) ** 2
         edm_loss = mse_loss * rearrange(weights, "b t -> b 1 t 1 1")
         
-        # Image domain loss
+        # Image domain loss - only compute on first and last frames (real data)
         img_loss = torch.tensor(0.0, device=x0.device, dtype=x0.dtype)
         if self.img_weight > 0:
             # Convert from model space to RGB [0, 1] range
             rgb_true = self._convert_to_rgb_range(x0)  # Shape: [B, C, T, H, W]
             rgb_pred = self._convert_to_rgb_range(out_pred.x0)  # Shape: [B, C, T, H, W]
             
-            # Simple MSE loss in image space
-            img_loss = ((rgb_true - rgb_pred) ** 2)
+            # Only compute loss on first and last frames (meaningful data)
+            # Frame 0: conditioning frame, Frame -1: target frame
+            rgb_true_meaningful = torch.cat([rgb_true[:, :, 0:1], rgb_true[:, :, -1:]], dim=2)  # [B, C, 2, H, W]
+            rgb_pred_meaningful = torch.cat([rgb_pred[:, :, 0:1], rgb_pred[:, :, -1:]], dim=2)  # [B, C, 2, H, W]
+            
+            # Simple MSE loss in image space (only on meaningful frames)
+            img_loss = ((rgb_true_meaningful - rgb_pred_meaningful) ** 2)
 
-        # HSV domain loss
+        # HSV domain loss - only compute on first and last frames (real data)
         hsv_loss = torch.tensor(0.0, device=x0.device, dtype=x0.dtype)
         if self.hsv_weight > 0:
             # Convert from model space to RGB [0, 1] range
             rgb_true = self._convert_to_rgb_range(x0)  # Shape: [B, C, T, H, W]
             rgb_pred = self._convert_to_rgb_range(out_pred.x0)  # Shape: [B, C, T, H, W]
             
+            # Only use first and last frames (meaningful data)
+            rgb_true_meaningful = torch.cat([rgb_true[:, :, 0:1], rgb_true[:, :, -1:]], dim=2)  # [B, C, 2, H, W]
+            rgb_pred_meaningful = torch.cat([rgb_pred[:, :, 0:1], rgb_pred[:, :, -1:]], dim=2)  # [B, C, 2, H, W]
+            
             # Reshape video tensors to combine batch and time dimensions for HSV conversion
-            # einops: combine B and T dimensions together
-            B, C, T, H, W = rgb_true.shape
-            rgb_true_flat = rearrange(rgb_true, 'b c t h w -> (b t) c h w')
-            rgb_pred_flat = rearrange(rgb_pred, 'b c t h w -> (b t) c h w')
+            # einops: combine B and T dimensions together (now only 2 meaningful frames)
+            B, C, T_meaningful, H, W = rgb_true_meaningful.shape  # T_meaningful = 2
+            rgb_true_flat = rearrange(rgb_true_meaningful, 'b c t h w -> (b t) c h w')
+            rgb_pred_flat = rearrange(rgb_pred_meaningful, 'b c t h w -> (b t) c h w')
             
             # Convert to HSV space using kornia
             hsv_true_flat = kornia.color.rgb_to_hsv(rgb_true_flat)
             hsv_pred_flat = kornia.color.rgb_to_hsv(rgb_pred_flat)
             
-            # Reshape back to original video shape
-            hsv_true = rearrange(hsv_true_flat, '(b t) c h w -> b c t h w', b=B, t=T)
-            hsv_pred = rearrange(hsv_pred_flat, '(b t) c h w -> b c t h w', b=B, t=T)
+            # Reshape back to original video shape (with 2 meaningful frames)
+            hsv_true = rearrange(hsv_true_flat, '(b t) c h w -> b c t h w', b=B, t=T_meaningful)
+            hsv_pred = rearrange(hsv_pred_flat, '(b t) c h w -> b c t h w', b=B, t=T_meaningful)
             
-            # Simple MSE loss in HSV space
+            # Simple MSE loss in HSV space (only on meaningful frames)
             hsv_loss = ((hsv_true - hsv_pred) ** 2)
         
         output_batch = {
