@@ -309,13 +309,13 @@ class ACT2CosmosPredict2Module(LightningModule):
         orig_video = torch.concat([init_frame, last_frame], dim=2)
         B, C, _, H, W = orig_video.shape
 
-        # Create more random frames to ensure tokenizer compatibility
-        # Need at least 6 random frames to handle tokenizer chunking edge cases
-        num_random_frames = 6
-        rand_color = torch.rand(B, C, num_random_frames, H, W, device=orig_video.device, dtype=orig_video.dtype)
+        # Create more frames by repeating true_frame to ensure tokenizer compatibility
+        # Need at least 6 additional frames to handle tokenizer chunking edge cases
+        num_adding_frames = 6
+        repeated_true_frames = true_frame.clone().unsqueeze(2).repeat(1, 1, num_adding_frames, 1, 1)
 
-        # Add random frames in the middle: init + 6 random + last = 8 total frames
-        video = torch.cat([init_frame, rand_color, last_frame], dim=2)     
+        # Add repeated true frames in the middle: init + 6 repeated true + last = 8 total frames
+        video = torch.cat([init_frame, repeated_true_frames, last_frame], dim=2)     
 
         # Convert to uint8
         video = (video * 255.0).to(torch.uint8)
