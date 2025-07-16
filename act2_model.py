@@ -1,11 +1,8 @@
+
+import torch
+from lightning import LightningModule
 import math
 import random
-import torch
-import hashlib
-from typing import Dict, List, Tuple
-from collections import OrderedDict
-
-from lightning import LightningModule
 
 from cosmos_predict2.models.video2world_model import (
     Predict2Video2WorldModelConfig,
@@ -14,7 +11,8 @@ from cosmos_predict2.models.video2world_model import (
 from cosmos_predict2.configs.base.config_video2world import PREDICT2_VIDEO2WORLD_PIPELINE_2B
 from cosmos_predict2.pipelines.video2world import Video2WorldPipeline
 from cosmos_predict2.auxiliary.text_encoder import CosmosT5TextEncoder
-from cosmos_predict2.conditioner import DataType, ReMapkey, BooleanFlag
+from cosmos_predict2.module.denoise_prediction import DenoisePrediction
+from cosmos_predict2.conditioner import T2VCondition, DataType, ReMapkey, BooleanFlag
 import imaginaire.utils.misc as misc
 from einops import rearrange
 
@@ -32,6 +30,54 @@ from cosmos_predict2.configs.base.config_video2world import (
 from cosmos_predict2.configs.base.defaults.ema import EMAConfig
 from cosmos_predict2.tokenizers.tokenizer import TokenizerInterface
 
+# Try to import kornia for HSV conversion, fallback to pure PyTorch if not available
+try:
+    import kornia
+    KORNIA_AVAILABLE = True
+except ImportError:
+    KORNIA_AVAILABLE = False
+    print("Warning: kornia not available, using pure PyTorch HSV conversion")
+    print("Install kornia with: pip install kornia")
+
+
+def rgb_to_hsv_pytorch_simple(rgb: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """
+    Simple RGB to HSV conversion using pure PyTorch as fallback.
+    rgb: tensor with values in [0, 1]
+    Returns HSV tensor, H in [0, 2π], S and V in [0, 1]
+    """
+    r, g, b = rgb.unbind(dim=-3)
+    
+    max_rgb, argmax_rgb = rgb.max(dim=-3)
+    min_rgb = rgb.min(dim=-3)[0]
+    delta = max_rgb - min_rgb
+    
+    # Hue calculation
+    h = torch.zeros_like(max_rgb)
+    
+    # Avoid division by zero
+    mask = delta > eps
+    
+    # Red is max
+    idx = (argmax_rgb == 0) & mask
+    h[idx] = (60.0 * ((g[idx] - b[idx]) / delta[idx]) + 360.0) % 360.0
+    
+    # Green is max  
+    idx = (argmax_rgb == 1) & mask
+    h[idx] = 60.0 * ((b[idx] - r[idx]) / delta[idx]) + 120.0
+    
+    # Blue is max
+    idx = (argmax_rgb == 2) & mask
+    h[idx] = 60.0 * ((r[idx] - g[idx]) / delta[idx]) + 240.0
+    
+    # Convert to radians (0 to 2π)
+    h = h * math.pi / 180.0
+    
+    # Saturation and Value
+    s = torch.where(max_rgb > eps, delta / max_rgb, torch.zeros_like(max_rgb))
+    v = max_rgb
+    
+    return torch.stack([h, s, v], dim=-3)
 
 # Cosmos Predict2 Image2Image 2B
 PREDICT2_IMAGE2IMAGE_NET_2B = LazyCall(MinimalV1LVGDiT)(
@@ -102,7 +148,7 @@ PREDICT2_IMAGE2IMAGE_PIPELINE_2B = Video2WorldPipelineConfig(
     sigma_conditional=0.0001,
     sigma_data=1.0,
     state_ch=16,
-    state_t=2,  # Was 24
+    state_t=2, #24,
     text_encoder_class="T5",
     tokenizer=LazyCall(TokenizerInterface)(
         chunk_duration=2,
@@ -124,15 +170,11 @@ PREDICT2_IMAGE2IMAGE_PIPELINE_2B = Video2WorldPipelineConfig(
 )
 
 class ACT2CosmosPredict2Model(LightningModule):
-    def __init__(self, 
-        dit_path: str, 
-        text_encoder_path: str, 
-        learning_rate: float,
-        max_cache_mem_size: int = 10000,  # Maximum number of cached embeddings
-        enable_text_cache: bool = True,
-        cache_on_gpu: bool = True,  # Store embeddings on GPU for faster access
-        gpu_cache_memory_limit_mb: int = 8192,  # GPU memory limit for cache in MB
-    ):
+    def __init__(self, dit_path: str, text_encoder_path: str, learning_rate: float, 
+                 hsv_weight: float = 0.1, 
+                 hue_weight: float = 1.0, 
+                 sat_weight: float = 1.0, 
+                 val_weight: float = 1.0):
         super().__init__()
         self.save_hyperparameters()
 
@@ -147,196 +189,26 @@ class ACT2CosmosPredict2Model(LightningModule):
             state_dict_dit_compatible = {k.replace("net.", ""): v for k, v in state_dict.items() if k.startswith("net.")}
             self.pipe.dit.load_state_dict(state_dict_dit_compatible, strict=False)
 
+        self.pipe.text_encoder = CosmosT5TextEncoder(device="cpu", cache_dir=self.hparams.text_encoder_path)
+        self.pipe.text_encoder.requires_grad_(False)
+        self.pipe.text_encoder.eval()
+
         self.loss_reduce = "mean"
         self.loss_scale = 10.0
         self.video_noise_multiplier = math.sqrt(2) 
 
+        # HSV loss parameters
+        self.hsv_weight = hsv_weight
+        self.hue_weight = hue_weight
+        self.sat_weight = sat_weight
+        self.val_weight = val_weight
+
         self.last_prediction = None
-        
-        # Text embedding cache for performance optimization (FIFO)
-        self.enable_text_cache = enable_text_cache
-        self.max_cache_mem_size = max_cache_mem_size
-        self.cache_on_gpu = cache_on_gpu
-        self.gpu_cache_memory_limit_mb = gpu_cache_memory_limit_mb
-        self.text_embedding_cache: OrderedDict[str, torch.Tensor] = OrderedDict()
-        self.cache_hit_count = 0
-        self.cache_miss_count = 0
-        self.cache_memory_usage_mb = 0.0
-        
-        print(f"Text embedding cache enabled: {self.enable_text_cache}")
-        if self.enable_text_cache:
-            print(f"Maximum cache size: {self.max_cache_mem_size}")
-            print(f"Cache storage: {'GPU' if self.cache_on_gpu else 'CPU'} memory")
-            print(f"Cache policy: FIFO (First In, First Out)")
-            if self.cache_on_gpu:
-                print(f"GPU cache memory limit: {self.gpu_cache_memory_limit_mb} MB")
-
-    def _get_prompt_hash(self, prompt: str) -> str:
-        """Generate a hash for a prompt to use as cache key."""
-        return hashlib.md5(prompt.encode('utf-8')).hexdigest()
-
-    def _estimate_tensor_memory_mb(self, tensor: torch.Tensor) -> float:
-        """Estimate tensor memory usage in MB."""
-        return tensor.numel() * tensor.element_size() / (1024 * 1024)
-
-    def _clean_cache_by_memory_limit(self):
-        """Clean cache using FIFO policy when memory limit is exceeded - remove one oldest item."""
-        if not self.cache_on_gpu or self.cache_memory_usage_mb <= self.gpu_cache_memory_limit_mb:
-            return
-        
-        if len(self.text_embedding_cache) > 0:
-            # Remove exactly one oldest entry (FIFO)
-            key, tensor = self.text_embedding_cache.popitem(last=False)
-            freed_memory = self._estimate_tensor_memory_mb(tensor)
-            self.cache_memory_usage_mb -= freed_memory
-            print(f"FIFO cache cleanup: Removed 1 oldest entry, freed {freed_memory:.2f} MB")
-
-    def _get_cached_text_embeddings(self, prompts: List[str]) -> Tuple[torch.Tensor, List[str]]:
-        """
-        Get cached text embeddings for prompts, returning embeddings and list of uncached prompts.
-        Updates access order for FIFO management.
-        """
-        if not self.enable_text_cache:
-            return None, prompts
-        
-        batch_size = len(prompts)
-        cached_embeddings = []
-        uncached_prompts = []
-        uncached_indices = []
-        
-        for i, prompt in enumerate(prompts):
-            prompt_hash = self._get_prompt_hash(prompt)
-            if prompt_hash in self.text_embedding_cache:
-                # Move to end to update access order (most recently used)
-                cached_embedding = self.text_embedding_cache.pop(prompt_hash)
-                self.text_embedding_cache[prompt_hash] = cached_embedding
-                
-                # Move to correct device and dtype if needed
-                if self.cache_on_gpu:
-                    # Already on GPU, just ensure correct dtype
-                    cached_embedding = cached_embedding.to(dtype=self.precision)
-                else:
-                    # Move from CPU to GPU
-                    cached_embedding = cached_embedding.to(device=self.device, dtype=self.precision)
-                
-                cached_embeddings.append(cached_embedding)
-                self.cache_hit_count += 1
-            else:
-                uncached_prompts.append(prompt)
-                uncached_indices.append(i)
-                cached_embeddings.append(None)
-                self.cache_miss_count += 1
-        
-        # If all prompts are cached, return the cached embeddings
-        if not uncached_prompts:
-            final_embeddings = torch.stack([emb for emb in cached_embeddings])
-            return final_embeddings, []
-        
-        # If some prompts are cached, we'll need to encode the uncached ones
-        return cached_embeddings, uncached_prompts
-
-    def _cache_text_embeddings(self, prompts: List[str], embeddings: torch.Tensor):
-        """Cache text embeddings using FIFO policy - remove oldest when full."""
-        if not self.enable_text_cache:
-            return
-        
-        # Cache the new embeddings (will be added at the end, making them newest)
-        for prompt, embedding in zip(prompts, embeddings):
-            prompt_hash = self._get_prompt_hash(prompt)
-            
-            # Remove oldest item if cache is at capacity
-            if len(self.text_embedding_cache) >= self.max_cache_mem_size:
-                # Remove exactly one oldest entry (FIFO)
-                removed_key, removed_tensor = self.text_embedding_cache.popitem(last=False)
-                if self.cache_on_gpu:
-                    self.cache_memory_usage_mb -= self._estimate_tensor_memory_mb(removed_tensor)
-                print(f"FIFO text cache: Removed oldest entry to make space")
-            
-            if self.cache_on_gpu:
-                # Store on GPU for faster access
-                cached_embedding = embedding.detach().to(dtype=self.precision)
-                # Update memory usage tracking
-                self.cache_memory_usage_mb += self._estimate_tensor_memory_mb(cached_embedding)
-            else:
-                # Store on CPU to save GPU memory
-                cached_embedding = embedding.detach().cpu()
-            
-            # Add new entry (becomes the newest in FIFO order)
-            self.text_embedding_cache[prompt_hash] = cached_embedding
-            
-            # If GPU memory limit is exceeded after adding, remove one oldest item
-            if self.cache_on_gpu and self.cache_memory_usage_mb > self.gpu_cache_memory_limit_mb:
-                self._clean_cache_by_memory_limit()
-
-    def _encode_prompts_with_cache(self, prompts: List[str]) -> torch.Tensor:
-        """
-        Encode prompts using cache when possible.
-        """
-        if not self.enable_text_cache:
-            # No caching, encode all prompts
-            return self.pipe.encode_prompt(prompts).to(dtype=self.precision)
-        
-        # Try to get cached embeddings
-        cached_result, uncached_prompts = self._get_cached_text_embeddings(prompts)
-        
-        if isinstance(cached_result, torch.Tensor):
-            # All prompts were cached
-            return cached_result
-        
-        # Some prompts need to be encoded
-        if uncached_prompts:
-            # Encode uncached prompts
-            new_embeddings = self.pipe.encode_prompt(uncached_prompts).to(dtype=self.precision)
-            
-            # Cache the new embeddings
-            self._cache_text_embeddings(uncached_prompts, new_embeddings)
-            
-            # Reconstruct the full batch
-            final_embeddings = []
-            uncached_idx = 0
-            
-            for i, prompt in enumerate(prompts):
-                if cached_result[i] is not None:
-                    # Use cached embedding
-                    final_embeddings.append(cached_result[i])
-                else:
-                    # Use newly encoded embedding
-                    final_embeddings.append(new_embeddings[uncached_idx])
-                    uncached_idx += 1
-            
-            return torch.stack(final_embeddings)
-        else:
-            # This shouldn't happen, but handle it gracefully
-            return self.pipe.encode_prompt(prompts).to(dtype=self.precision)
-
-    def get_cache_stats(self) -> Dict[str, any]:
-        """Get cache statistics for monitoring."""
-        total_requests = self.cache_hit_count + self.cache_miss_count
-        hit_rate = (self.cache_hit_count / total_requests * 100) if total_requests > 0 else 0
-        
-        # Get current GPU memory usage if available
-        gpu_memory_used_mb = 0.0
-        gpu_memory_total_mb = 0.0
-        if torch.cuda.is_available() and self.device.type == 'cuda':
-            gpu_memory_used_mb = torch.cuda.memory_allocated(self.device) / (1024 * 1024)
-            gpu_memory_total_mb = torch.cuda.memory_reserved(self.device) / (1024 * 1024)
-        
-        return {
-            "cache_mem_size": len(self.text_embedding_cache),
-            "cache_hits": self.cache_hit_count,
-            "cache_misses": self.cache_miss_count,
-            "hit_rate_percent": hit_rate,
-            "total_requests": total_requests,
-            "cache_memory_mb": self.cache_memory_usage_mb if self.cache_on_gpu else 0.0,
-            "gpu_memory_used_mb": gpu_memory_used_mb,
-            "gpu_memory_total_mb": gpu_memory_total_mb,
-            "cache_storage": "GPU" if self.cache_on_gpu else "CPU"
-        }
 
     def setup(self, stage: str):
         if stage == "fit":
-            self.pipe.text_encoder = CosmosT5TextEncoder(device=self.device, cache_dir=self.hparams.text_encoder_path)
-            # Freeze the text encoder's parameters and set it to evaluation mode
+            # Create text encoder on CPU and keep it there to save GPU memory
+            self.pipe.text_encoder = CosmosT5TextEncoder(device="cpu", cache_dir=self.hparams.text_encoder_path)
             self.pipe.text_encoder.requires_grad_(False)
             self.pipe.text_encoder.eval()
 
@@ -348,11 +220,14 @@ class ACT2CosmosPredict2Model(LightningModule):
             self.pipe.denoising_model().requires_grad_(True)
             self.pipe.denoising_model().train()
 
-    def process_batch(self, batch: dict) -> dict:
-        prompts = batch["txt"]
-        cond_frame = batch["png"]
-        target_frame = batch["tif"]
+    def _ensure_text_encoder_on_cpu(self):
+        """Move text encoder to CPU to save GPU memory during training"""
+        if hasattr(self.pipe, 'text_encoder') and self.pipe.text_encoder is not None:
+            self.pipe.text_encoder = self.pipe.text_encoder.to('cpu')
 
+    def process_batch(self, batch: dict) -> dict:
+        self._ensure_text_encoder_on_cpu()
+        prompts = batch["txt"]
         if self.training:
             shuffled_prompts = []
             for prompt in prompts:
@@ -362,13 +237,14 @@ class ACT2CosmosPredict2Model(LightningModule):
             prompts = shuffled_prompts
             batch['txt'] = prompts
 
+        cond_frame = batch["png"]
+        target_frame = batch["tif"]
         video = torch.stack([cond_frame, target_frame], dim=2)
         video = (video * 255.0).to(torch.uint8)
         B, C, T, H, W = video.shape
-        
-        # Use cached text embeddings for better performance
-        text_embeddings = self._encode_prompts_with_cache(prompts)
-        
+        # Ensure text embeddings are on the same device as the video tensor
+        text_embeddings = self.pipe.encode_prompt(prompts)
+        text_embeddings = text_embeddings.to(dtype=self.precision, device=video.device)
         return {
             "video": video,
             "t5_text_embeddings": text_embeddings,
@@ -380,8 +256,10 @@ class ACT2CosmosPredict2Model(LightningModule):
 
     def draw_training_sigma_and_epsilon(self, x0_size: torch.Size, is_video_batch: bool) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size = x0_size[0]
-        epsilon = torch.randn(x0_size, device=self.device)
-        sigma_B = self.pipe.scheduler.sample_sigma(batch_size).to(device=self.device)
+        # Use the device of the input tensor instead of self.device for DDP compatibility
+        device = next(self.parameters()).device
+        epsilon = torch.randn(x0_size, device=device)
+        sigma_B = self.pipe.scheduler.sample_sigma(batch_size).to(device=device)
         sigma_B_1 = rearrange(sigma_B, "b -> b 1")
         multiplier = self.video_noise_multiplier if is_video_batch else 1
         sigma_B_1 = sigma_B_1 * multiplier
@@ -390,69 +268,93 @@ class ACT2CosmosPredict2Model(LightningModule):
     def get_per_sigma_loss_weights(self, sigma: torch.Tensor) -> torch.Tensor:
         return (sigma**2 + self.pipe.sigma_data**2) / (sigma * self.pipe.sigma_data) ** 2
 
+    def convert_to_rgb_range(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Convert tensor from [-1, 1] range to [0, 1] range for HSV conversion.
+        """
+        return (x + 1.0) / 2.0
+
     def compute_loss(self, x0, condition, epsilon, sigma) -> tuple[dict, torch.Tensor]:
         mean, std = x0, sigma
         xt = mean + epsilon * rearrange(std, "b t -> b 1 t 1 1")
         out_pred = self.pipe.denoise(xt, sigma, condition)
         weights = self.get_per_sigma_loss_weights(sigma=sigma)
-        mse_loss = (x0 - out_pred.x0) ** 2
-        edm_loss = mse_loss * rearrange(weights, "b t -> b 1 t 1 1")
+        
+        # Standard RGB MSE loss
+        mse_pred = (x0 - out_pred.x0) ** 2
+        edm_loss = mse_pred * rearrange(weights, "b t -> b 1 t 1 1")
+        
+        # HSV domain loss
+        hsv_loss = torch.tensor(0.0, device=x0.device, dtype=x0.dtype)
+        if self.hsv_weight > 0:
+            try:
+                # Convert from model space to RGB [0, 1] range
+                rgb_true = self.convert_to_rgb_range(x0)
+                rgb_pred = self.convert_to_rgb_range(out_pred.x0)
+                
+                # Convert to HSV space
+                if KORNIA_AVAILABLE:
+                    hsv_true = kornia.color.rgb_to_hsv(rgb_true)
+                    hsv_pred = kornia.color.rgb_to_hsv(rgb_pred)
+                else:
+                    hsv_true = rgb_to_hsv_pytorch_simple(rgb_true)
+                    hsv_pred = rgb_to_hsv_pytorch_simple(rgb_pred)
+                
+                # Simple MSE loss in HSV space
+                hsv_loss = ((hsv_true - hsv_pred) ** 2)
+            except Exception as e:
+                print(f"Warning: HSV loss computation failed: {e}")
+                hsv_loss = torch.tensor(0.0, device=x0.device, dtype=x0.dtype)
         
         output_batch = {
             "out_pred": out_pred,
-            "mse_loss": mse_loss.mean(),
+            "mse_loss": mse_pred.mean(),
             "edm_loss": edm_loss.mean(),
+            "hsv_loss": hsv_loss.mean(),
         }
         
-        ret_loss = edm_loss
+        # Combine losses - ensure both are on the same device
+        hsv_loss = hsv_loss.to(device=edm_loss.device)
+        ret_loss = edm_loss + self.hsv_weight * hsv_loss
         
         return output_batch, ret_loss
 
-
-    def _shared_step(self, data_batch):
+    def core_step(self, data_batch):
         _, x0, condition = self.pipe.get_data_and_condition(data_batch)
         sigma, epsilon = self.draw_training_sigma_and_epsilon(x0.size(), condition.data_type == DataType.VIDEO)
         x0, condition, epsilon, sigma = self.pipe.broadcast_split_for_model_parallelsim(x0, condition, epsilon, sigma)
-        output, loss_tensor = self.compute_loss(x0, condition, epsilon, sigma)
+        output, loss = self.compute_loss(x0, condition, epsilon, sigma)
         
         if self.loss_reduce == "mean":
-            loss = loss_tensor.mean() * self.loss_scale
+            loss = loss.mean() * self.loss_scale
         else:
-            loss = loss_tensor.sum(dim=1).mean() * self.loss_scale
+            loss = loss.sum(dim=1).mean() * self.loss_scale
         return output, loss
 
     def training_step(self, batch: dict, batch_idx: int) -> torch.Tensor:
         data_batch = self.process_batch(batch)
-        output_batch, loss = self._shared_step(data_batch)
+        output_batch, loss = self.core_step(data_batch)
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         self.log('train_mse_loss', output_batch['mse_loss'], on_step=True, on_epoch=True, prog_bar=False, logger=True)
         self.log('train_edm_loss', output_batch['edm_loss'], on_step=True, on_epoch=True, prog_bar=False, logger=True)
-        
-        # Log cache statistics every 100 steps
-        if batch_idx % 100 == 0 and self.enable_text_cache:
-            cache_stats = self.get_cache_stats()
-            self.log('cache_hit_rate', cache_stats['hit_rate_percent'], on_step=True, on_epoch=False, prog_bar=False, logger=True)
-            self.log('cache_mem_size', cache_stats['cache_mem_size'], on_step=True, on_epoch=False, prog_bar=False, logger=True)
-            if self.cache_on_gpu:
-                self.log('cache_memory_mb', cache_stats['cache_memory_mb'], on_step=True, on_epoch=False, prog_bar=False, logger=True)
-                self.log('gpu_memory_used_mb', cache_stats['gpu_memory_used_mb'], on_step=True, on_epoch=False, prog_bar=False, logger=True)
-        
+        self.log('train_hsv_loss', output_batch['hsv_loss'], on_step=True, on_epoch=True, prog_bar=False, logger=True)
         if batch_idx == 0:
             self._generate_denoised_image(data_batch)
         return loss
 
     def validation_step(self, batch: dict, batch_idx: int) -> None:
         data_batch = self.process_batch(batch)
-        output_batch, loss = self._shared_step(data_batch)
-        # Log the evaluation/test loss.
+        output_batch, loss = self.core_step(data_batch)
+        # Log the validation/test loss.
         self.log(f'val_loss', loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log(f'val_hsv_loss', output_batch['hsv_loss'], on_step=False, on_epoch=True, prog_bar=False, logger=True)
         if batch_idx == 0:
             self._generate_denoised_image(data_batch)
         return loss
     
     def test_step(self, batch: dict, batch_idx: int) -> None:
         data_batch = self.process_batch(batch)
-        _, loss = self._shared_step(data_batch)
+        _, loss = self.core_step(data_batch)
         self.log(f'test_loss', loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
         
     def _generate_denoised_image(self, data_batch: dict):
@@ -465,8 +367,10 @@ class ACT2CosmosPredict2Model(LightningModule):
                 _H // self.pipe.tokenizer.spatial_compression_factor,
                 _W // self.pipe.tokenizer.spatial_compression_factor,
             ]
+            # Use the device of model parameters for DDP compatibility
+            device = next(self.parameters()).device
             x_sigma_max = misc.arch_invariant_rand(
-                (data_batch["video"].shape[0],) + tuple(state_shape), torch.float32, self.device, 0
+                (data_batch["video"].shape[0],) + tuple(state_shape), torch.float32, device, 0
             ) * self.pipe.scheduler.config.sigma_max
             
             scheduler = self.pipe.scheduler
@@ -487,22 +391,5 @@ class ACT2CosmosPredict2Model(LightningModule):
     def configure_optimizers(self):
         trainable_params = [p for p in self.pipe.parameters() if p.requires_grad]
         return torch.optim.AdamW(trainable_params, lr=self.hparams.learning_rate)
-    
-    def on_train_epoch_end(self):
-        """Print cache statistics at the end of each epoch."""
-        if self.enable_text_cache:
-            cache_stats = self.get_cache_stats()
-            print(f"\n=== Text Embedding Cache Stats (Epoch {self.current_epoch}) ===")
-            print(f"Cache size: {cache_stats['cache_mem_size']}/{self.max_cache_mem_size}")
-            print(f"Hit rate: {cache_stats['hit_rate_percent']:.1f}%")
-            print(f"Total requests: {cache_stats['total_requests']}")
-            print(f"Cache hits: {cache_stats['cache_hits']}")
-            print(f"Cache misses: {cache_stats['cache_misses']}")
-            print(f"Cache storage: {cache_stats['cache_storage']}")
-            if self.cache_on_gpu:
-                print(f"Cache memory usage: {cache_stats['cache_memory_mb']:.2f} MB")
-                print(f"GPU memory used: {cache_stats['gpu_memory_used_mb']:.2f} MB")
-                print(f"GPU memory total: {cache_stats['gpu_memory_total_mb']:.2f} MB")
-            print("="*50)
     
     

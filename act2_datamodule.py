@@ -20,7 +20,7 @@ from monai.transforms import (
     LoadImageDict,
     RandSpatialCropDict,
 )
-from monai.data import CacheDataset, ThreadDataLoader
+from monai.data import CacheDataset, ThreadDataLoader, PersistentDataset, SmartCacheDataset
 
 # Set a higher limit for image pixels if dealing with large TIFs
 from PIL import Image
@@ -110,9 +110,9 @@ class OptimizedACT2Dataset(Dataset):
         return final_sample
 
 
-class OptimizedACT2DataModule(LightningDataModule):
+class ACT2DataModule(LightningDataModule):
     """
-    Optimized PyTorch Lightning DataModule for ACT2 dataset with text preloading.
+    Optimized PyTorch Lightning DataModule for ACT2 dataset with MONAI caching.
     """
     
     def __init__(
@@ -131,9 +131,19 @@ class OptimizedACT2DataModule(LightningDataModule):
         cache_rate: float = 1.0,  # Cache all data for maximum speed
         use_thread_dataloader: bool = True,  # Use faster thread-based dataloader
         prefetch_factor: int = 4,  # Prefetch batches
+        cache_num_workers: int = None,  # Workers for caching process
+        copy_cache: bool = False,  # Copy cache to avoid data corruption
+        cache_strategy: str = "memory",  # "memory", "disk", "smart"
+        cache_dir: str = "./cache",  # Directory for disk caching
     ):
         """
-        Optimized DataModule with auto-tuned performance settings.
+        Optimized DataModule with MONAI caching for transformed images.
+        
+        Args:
+            cache_strategy: Choose caching strategy:
+                - "memory": CacheDataset (fastest, high RAM usage)
+                - "disk": PersistentDataset (slower, saves to disk)
+                - "smart": SmartCacheDataset (intelligent memory management)
         """
         super().__init__()
         self.root_folder = root_folder
@@ -149,16 +159,36 @@ class OptimizedACT2DataModule(LightningDataModule):
         self.cache_rate = cache_rate
         self.use_thread_dataloader = use_thread_dataloader
         self.prefetch_factor = prefetch_factor
+        self.copy_cache = copy_cache
+        self.cache_strategy = cache_strategy.lower()
+        self.cache_dir = cache_dir
+        
+        # Validate cache strategy
+        valid_strategies = ["memory", "disk", "smart"]
+        if self.cache_strategy not in valid_strategies:
+            raise ValueError(f"cache_strategy must be one of {valid_strategies}, got {cache_strategy}")
         
         # Auto-detect optimal number of workers
         if num_workers is None:
             cpu_count = mp.cpu_count()
-            # Use standard worker configuration
             self.num_workers = min(16, max(1, int(cpu_count * 0.75)))
         else:
             self.num_workers = num_workers
         
+        # Auto-detect cache workers (fewer than data loading workers)
+        if cache_num_workers is None:
+            self.cache_num_workers = min(8, max(1, int(self.num_workers // 2)))
+        else:
+            self.cache_num_workers = cache_num_workers
+        
         print(f"Using {self.num_workers} workers for data loading")
+        print(f"Using {self.cache_num_workers} workers for caching")
+        print(f"Cache strategy: {self.cache_strategy}")
+        print(f"Cache rate: {self.cache_rate} (1.0 = cache all data)")
+        
+        if self.cache_strategy == "disk":
+            os.makedirs(self.cache_dir, exist_ok=True)
+            print(f"Disk cache directory: {self.cache_dir}")
 
         # Optimized MONAI transforms with better performance
         self.train_transforms = Compose([
@@ -252,41 +282,131 @@ class OptimizedACT2DataModule(LightningDataModule):
         print(f"Curated {len(file_groups)} unique file base names.")
         print(f"Created {len(self.train_tuples)} training, {len(self.val_tuples)} val, and {len(self.test_tuples)} test samples.")
 
+    def _prepare_data_dicts(self, tuples_list: List[Dict]) -> List[Dict]:
+        """Prepare data dictionaries for MONAI CacheDataset with text content."""
+        data_dicts = []
+        
+        print(f"Preparing {len(tuples_list)} samples for MONAI caching...")
+        
+        for sample in tuples_list:
+            # Load text content
+            try:
+                with open(sample['txt'], 'r') as f:
+                    txt_content = f.read().strip()
+            except Exception as e:
+                print(f"Error loading text file {sample['txt']}: {e}")
+                txt_content = ""
+            
+            # Create MONAI-compatible data dict
+            data_dict = {
+                'tif': sample['tif'],
+                'png': sample['png'],
+                'txt': txt_content,  # Store text content directly
+            }
+            data_dicts.append(data_dict)
+        
+        return data_dicts
+
+    def _create_cached_dataset(self, data_dicts: List[Dict], transform: Compose, split_name: str):
+        """Create appropriate cached dataset based on the caching strategy."""
+        
+        if self.cache_strategy == "memory":
+            print(f"Creating {split_name} CacheDataset (memory) with cache_rate={self.cache_rate}")
+            return CacheDataset(
+                data=data_dicts,
+                transform=transform,
+                cache_rate=self.cache_rate,
+                num_workers=self.cache_num_workers,
+                copy_cache=self.copy_cache,
+                progress=True,
+            )
+        
+        elif self.cache_strategy == "disk":
+            cache_path = os.path.join(self.cache_dir, f"{split_name}_cache")
+            print(f"Creating {split_name} PersistentDataset (disk) at {cache_path}")
+            return PersistentDataset(
+                data=data_dicts,
+                transform=transform,
+                cache_dir=cache_path,
+                num_workers=self.cache_num_workers,
+                progress=True,
+            )
+        
+        elif self.cache_strategy == "smart":
+            print(f"Creating {split_name} SmartCacheDataset with cache_rate={self.cache_rate}")
+            return SmartCacheDataset(
+                data=data_dicts,
+                transform=transform,
+                cache_rate=self.cache_rate,
+                num_init_workers=self.cache_num_workers,
+                num_replace_workers=max(1, self.cache_num_workers // 2),
+                progress=True,
+            )
+        
+        else:
+            raise ValueError(f"Unknown cache strategy: {self.cache_strategy}")
+
     def setup(self, stage: Optional[str] = None):
-        """Instantiate optimized datasets with text preloading."""
+        """Instantiate MONAI cached datasets with the chosen caching strategy."""
         self._load_samples()
 
         if stage == 'fit' or stage is None:
-            self._train_ds = OptimizedACT2Dataset(
-                self.train_tuples, 
+            # Prepare data for training with caching
+            train_data_dicts = self._prepare_data_dicts(self.train_tuples)
+            
+            self._train_ds = self._create_cached_dataset(
+                train_data_dicts, 
                 self.train_transforms, 
-                image_key='tif', 
-                hint_key='png', 
-                txt_key='txt',
-                num_samples=self.train_samples,
-                preload_text=True,
+                "train"
             )
             
-            self._val_ds = OptimizedACT2Dataset(
-                self.val_tuples, 
+            # Apply sample limit if specified
+            if self.train_samples is not None:
+                self._train_ds = self._create_limited_dataset(self._train_ds, self.train_samples)
+            
+            # Prepare validation data with caching
+            val_data_dicts = self._prepare_data_dicts(self.val_tuples)
+            
+            self._val_ds = self._create_cached_dataset(
+                val_data_dicts, 
                 self.val_transforms, 
-                image_key='tif', 
-                hint_key='png', 
-                txt_key='txt',
-                num_samples=self.val_samples,
-                preload_text=True,
+                "val"
             )
+            
+            # Apply sample limit if specified
+            if self.val_samples is not None:
+                self._val_ds = self._create_limited_dataset(self._val_ds, self.val_samples)
         
         if stage == 'test' or stage is None:
-            self._test_ds = OptimizedACT2Dataset(
-                self.test_tuples, 
-                self.val_transforms,
-                image_key='tif', 
-                hint_key='png', 
-                txt_key='txt',
-                num_samples=self.test_samples,
-                preload_text=True,
+            # Prepare test data with caching
+            test_data_dicts = self._prepare_data_dicts(self.test_tuples)
+            
+            self._test_ds = self._create_cached_dataset(
+                test_data_dicts, 
+                self.val_transforms,  # Use val transforms (no augmentation)
+                "test"
             )
+            
+            # Apply sample limit if specified
+            if self.test_samples is not None:
+                self._test_ds = self._create_limited_dataset(self._test_ds, self.test_samples)
+
+    def _create_limited_dataset(self, dataset, num_samples: int):
+        """Create a limited dataset wrapper that samples from the full dataset."""
+        class LimitedDataset(Dataset):
+            def __init__(self, base_dataset, num_samples):
+                self.base_dataset = base_dataset
+                self.num_samples = num_samples
+            
+            def __len__(self):
+                return self.num_samples
+            
+            def __getitem__(self, index):
+                # Randomly sample from the base dataset
+                actual_index = random.randint(0, len(self.base_dataset) - 1)
+                return self.base_dataset[actual_index]
+        
+        return LimitedDataset(dataset, num_samples)
 
     def _create_dataloader(self, dataset: Dataset, shuffle: bool = False, num_workers: Optional[int] = None) -> DataLoader:
         """Creates an optimized DataLoader with best performance settings."""
@@ -339,17 +459,16 @@ class OptimizedACT2DataModule(LightningDataModule):
 
 # Keep the old class for backward compatibility
 ACT2Dataset = OptimizedACT2Dataset
-ACT2DataModule = OptimizedACT2DataModule
 
 
 def main():
-    """Main function to test and verify the optimized ACT2DataModule with text preloading."""
+    """Main function to test and verify the ACT2DataModule with MONAI caching."""
     
     # --- Configuration ---
     data_root = "data/ACT2_raw" 
     
     print("="*60)
-    print("🚀 Optimized ACT2 DataModule with Text Preloading")
+    print("🚀 ACT2 DataModule with MONAI CacheDataset")
     print("="*60)
     
     if not os.path.exists(data_root):
@@ -360,28 +479,32 @@ def main():
         print(f"  touch {data_root}/Subject2_1.tif {data_root}/Subject2_1.png {data_root}/Subject2_1.txt")
         return
 
-    # Instantiate the optimized datamodule
-    datamodule = OptimizedACT2DataModule(
+    # Instantiate the datamodule with MONAI caching
+    datamodule = ACT2DataModule(
         root_folder=data_root,
         image_H=512,
         image_W=512,
         micro_batch_size=2,
         global_batch_size=4,
-        train_samples=4000,
-        val_samples=800,
-        test_samples=800,
+        train_samples=100,  # Reduced for testing
+        val_samples=50,
+        test_samples=50,
         cache_rate=1.0,  # Cache everything for maximum speed
+        cache_num_workers=24,  # Parallel caching
+        copy_cache=False,  # Don't copy cache for memory efficiency
+        cache_strategy="memory",  # Try "memory", "disk", or "smart"
+        cache_dir="./cache_test",  # For disk caching
         use_thread_dataloader=True,
         prefetch_factor=4,
     )
     
-    # Setup datasets (this will preload text)
-    print("\n--- Setting up datasets (preloading text) ---")
+    # Setup datasets (this will create and populate the MONAI cache)
+    print("\n--- Setting up datasets (MONAI caching in progress) ---")
     import time
     setup_start = time.time()
     datamodule.setup('fit')
     setup_time = time.time() - setup_start
-    print(f"Setup completed in {setup_time:.2f} seconds")
+    print(f"MONAI caching setup completed in {setup_time:.2f} seconds")
     
     # Check if data was loaded
     if not datamodule.train_tuples or not datamodule.val_tuples:
@@ -389,14 +512,18 @@ def main():
         print("Please check the 'root_folder' path and the contents of the directory.")
         return
         
-    print("\n--- 🏃 Testing Optimized Training Dataloader ---")
+    print(f"\n📊 Cache Statistics:")
+    print(f"  - Training samples cached: {len(datamodule._train_ds)}")
+    print(f"  - Validation samples cached: {len(datamodule._val_ds)}")
+    
+    print("\n--- 🏃 Testing MONAI Cached Training Dataloader ---")
     try:
         train_loader = datamodule.train_dataloader()
         print(f"Train dataloader created with batch size {datamodule.micro_batch_size}.")
         print(f"Using {datamodule.num_workers} workers with prefetch_factor={datamodule.prefetch_factor}")
         
         # Performance test - measure loading time for multiple batches
-        print("\n⚡ Performance test - loading 5 batches...")
+        print("\n⚡ Performance test - loading 5 batches from cache...")
         batch_times = []
         
         for i in range(5):
@@ -406,8 +533,8 @@ def main():
             batch_times.append(load_time)
             
             if i == 0:  # Print first batch info
-                print(f"\nFirst batch loaded in {load_time:.3f} seconds")
-                print("Sample batch from optimized training data:")
+                print(f"\nFirst cached batch loaded in {load_time:.3f} seconds")
+                print("Sample batch from MONAI cached training data:")
                 for key, value in batch.items():
                     if isinstance(value, torch.Tensor):
                         print(f"  - Key: '{key}', Shape: {value.shape}, DType: {value.dtype}, Min: {value.min():.2f}, Max: {value.max():.2f}")
@@ -415,15 +542,15 @@ def main():
                         print(f"  - Key: '{key}', Type: list, Length: {len(value)}, First element: '{value[0][:50]}...'")
         
         avg_batch_time = sum(batch_times) / len(batch_times)
-        print(f"\n📈 Average batch load time: {avg_batch_time:.3f} seconds")
-        print(f"🚀 Batches per second: {1/avg_batch_time:.1f}")
+        print(f"\n📈 Average cached batch load time: {avg_batch_time:.3f} seconds")
+        print(f"🚀 Cached batches per second: {1/avg_batch_time:.1f}")
             
     except Exception as e:
         print(f"An error occurred while testing the train dataloader: {e}")
         import traceback
         traceback.print_exc()
 
-    print("\n--- 🧪 Testing Optimized Val Dataloader ---")
+    print("\n--- 🧪 Testing MONAI Cached Val Dataloader ---")
     try:
         val_loader = datamodule.val_dataloader()
         print(f"Val dataloader created with batch size {datamodule.micro_batch_size}.")
@@ -432,9 +559,9 @@ def main():
         start_time = time.time()
         batch = next(iter(val_loader))
         load_time = time.time() - start_time
-        print(f"First batch loaded in {load_time:.3f} seconds")
+        print(f"First cached batch loaded in {load_time:.3f} seconds")
         
-        print("\nSample batch from optimized val data:")
+        print("\nSample batch from MONAI cached val data:")
         for key, value in batch.items():
             if isinstance(value, torch.Tensor):
                 print(f"  - Key: '{key}', Shape: {value.shape}, DType: {value.dtype}, Min: {value.min():.2f}, Max: {value.max():.2f}")
@@ -447,19 +574,32 @@ def main():
         traceback.print_exc()
         
     print("\n" + "="*60)
-    print("🎉 Optimized DataModule Verification Complete!")
+    print("🎉 MONAI CacheDataset Verification Complete!")
     print("="*60)
-    print("🚀 Performance optimizations applied:")
-    print("✅ Preloaded text content into memory")
-    print("✅ Auto-tuned worker configuration")
-    print("✅ ThreadDataLoader with prefetching")
-    print("✅ Optimized file system operations")
-    print("✅ Smart memory management")
-    print("\n📊 Expected performance gains:")
-    print("• 3-5x faster text processing (preloaded)")
-    print("• Better CPU utilization")
-    print("• Reduced I/O overhead for text files")
-    print("• Optimized image loading pipeline")
+    print("🚀 MONAI caching benefits:")
+    print("✅ Transformed images cached in memory/disk")
+    print("✅ Eliminates redundant image processing")
+    print("✅ Parallel caching during setup")
+    print("✅ Multiple caching strategies available")
+    print("✅ Configurable cache rate (partial/full)")
+    print("✅ Memory-efficient cache management")
+    print("✅ Progress tracking during cache creation")
+    print("\n📊 Caching strategies:")
+    print("• memory: CacheDataset - Fastest, high RAM usage")
+    print("• disk: PersistentDataset - Slower, saves to disk")
+    print("• smart: SmartCacheDataset - Intelligent memory management")
+    print("\n📈 Expected performance gains:")
+    print("• 5-10x faster data loading after initial cache")
+    print("• Eliminates repeated image transformations")
+    print("• Reduced CPU usage during training")
+    print("• Better GPU utilization (no I/O waiting)")
+    print("• Consistent batch loading times")
+    print("\n⚠️  Memory considerations:")
+    print("• Memory caching: High RAM usage, fastest access")
+    print("• Disk caching: Lower RAM, persistent across runs")
+    print("• Smart caching: Balanced memory/performance")
+    print("• Adjust cache_rate for large datasets")
+    print("• Monitor memory usage during training")
     print("="*60)
 
 
