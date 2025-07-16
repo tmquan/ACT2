@@ -63,26 +63,26 @@ class TensorBoardImageCallback(Callback):
             logger = trainer.logger.experiment
             
             # Get full batches for logging
-            input_batch = batch['png']  # Shape: (B, C, H, W)
-            gt_batch = batch['tif']     # Shape: (B, C, H, W)
+            orig_batch = batch['png']  # Shape: (B, C, H, W)
+            true_batch = batch['tif']     # Shape: (B, C, H, W)
             
             # The model prediction is already the single predicted frame.
             pred_tif = pred_vid
 
             # For TensorBoard, we'll log the first sample of the batch for clarity.
-            input_img = input_batch
-            gt_img = gt_batch
-            pred_img = (pred_tif.clamp(-1, 1) + 1) / 2
+            orig_img = orig_batch
+            true_img = true_batch
+            pred_img = pred_tif.clamp(-1, 1) / 2.0 + 0.5
             prompt = batch['txt']
 
             # Create a grid for images
-            # We want to show input, gt, and prediction for each item in the batch
+            # We want to show orig, gt, and prediction for each item in the batch
             # Concatenate along the batch dimension
-            grid_tensor = torch.cat([input_img, gt_img, pred_img], dim=3)
+            grid_tensor = torch.cat([orig_img, true_img, pred_img], dim=3)
             grid = torchvision.utils.make_grid(grid_tensor, nrow=1, padding=0)
             
             logger.add_image(
-                f"{stage}/images (Input_GT_Pred)", 
+                f"{stage}/images (Input_true_Pred)", 
                 grid, 
                 global_step=trainer.current_epoch
             )
