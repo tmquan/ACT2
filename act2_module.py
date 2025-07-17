@@ -311,12 +311,10 @@ class ACT2CosmosPredict2Module(LightningModule):
 
         # Create more frames by repeating true_frame to ensure tokenizer compatibility
         # Need at least 6 additional frames to handle tokenizer chunking edge cases
-        num_adding_frames = 6
-        repeated_true_frames = true_frame.clone().unsqueeze(2).repeat(1, 1, num_adding_frames, 1, 1)
-
-        # Add repeated true frames in the middle: init + 6 repeated true + last = 8 total frames
-        video = torch.cat([init_frame, repeated_true_frames, last_frame], dim=2)     
-
+        num_padding = 6
+        copy_stream = true_frame.clone().unsqueeze(2).repeat(1, 1, num_padding, 1, 1)
+        video = torch.cat([init_frame, last_frame, copy_stream], dim=2)     
+        
         # Convert to uint8
         video = (video * 255.0).to(torch.uint8)
             
@@ -519,9 +517,9 @@ class ACT2CosmosPredict2Module(LightningModule):
             rgb_pred = self._convert_to_rgb_range(out_pred.x0)  # Shape: [B, C, T, H, W]
             
             # Only compute loss on first and last frames (meaningful data)
-            # Frame 0: conditioning frame, Frame -1: target frame
-            rgb_true_meaningful = torch.cat([rgb_true[:, :, 0:1], rgb_true[:, :, -1:]], dim=2)  # [B, C, 2, H, W]
-            rgb_pred_meaningful = torch.cat([rgb_pred[:, :, 0:1], rgb_pred[:, :, -1:]], dim=2)  # [B, C, 2, H, W]
+            # Frame 0: conditioning frame, Frame 1: target frame
+            rgb_true_meaningful = torch.cat([rgb_true[:, :, 0:1], rgb_true[:, :, 1:2]], dim=2)  # [B, C, 2, H, W]
+            rgb_pred_meaningful = torch.cat([rgb_pred[:, :, 0:1], rgb_pred[:, :, 1:2]], dim=2)  # [B, C, 2, H, W]
             
             # Simple MSE loss in image space (only on meaningful frames)
             img_loss = ((rgb_true_meaningful - rgb_pred_meaningful) ** 2)
@@ -534,8 +532,8 @@ class ACT2CosmosPredict2Module(LightningModule):
             rgb_pred = self._convert_to_rgb_range(out_pred.x0)  # Shape: [B, C, T, H, W]
             
             # Only use first and last frames (meaningful data)
-            rgb_true_meaningful = torch.cat([rgb_true[:, :, 0:1], rgb_true[:, :, -1:]], dim=2)  # [B, C, 2, H, W]
-            rgb_pred_meaningful = torch.cat([rgb_pred[:, :, 0:1], rgb_pred[:, :, -1:]], dim=2)  # [B, C, 2, H, W]
+            rgb_true_meaningful = torch.cat([rgb_true[:, :, 0:1], rgb_true[:, :, 1:2]], dim=2)  # [B, C, 2, H, W]
+            rgb_pred_meaningful = torch.cat([rgb_pred[:, :, 0:1], rgb_pred[:, :, 1:2]], dim=2)  # [B, C, 2, H, W]
             
             # Reshape video tensors to combine batch and time dimensions for HSV conversion
             # einops: combine B and T dimensions together (now only 2 meaningful frames)
@@ -601,7 +599,7 @@ class ACT2CosmosPredict2Module(LightningModule):
             sigma_min = scheduler.sigmas[-1].to(sample.device, dtype=torch.float32)
             samples = x0_fn(sample, sigma_min.repeat(sample.shape[0]))
             video = self.pipe.decode(samples)
-            self.last_prediction = video[:, :, -1, :, :]
+            self.last_prediction = video[:, :, 1, :, :]
 
     def setup(self, stage: str):
         """Configure models for different training stages."""
