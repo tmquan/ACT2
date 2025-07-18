@@ -217,6 +217,7 @@ class ACT2CosmosPredict2Module(LightningModule):
         img_weight: float = 0.1,
         cache_size: int = 1000,
         enable_cache: bool = True,
+        loss_scale: float = 10.0,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -228,6 +229,7 @@ class ACT2CosmosPredict2Module(LightningModule):
         self.video_noise_multiplier = video_noise_multiplier
         self.hsv_weight = hsv_weight
         self.img_weight = img_weight
+        self.loss_scale = loss_scale
         self.precision = torch.bfloat16
         self.last_prediction = None
         
@@ -580,7 +582,7 @@ class ACT2CosmosPredict2Module(LightningModule):
         img_loss = img_loss.to(device=edm_loss.device)
         hsv_loss = hsv_loss.to(device=edm_loss.device)
         ret_loss = (
-            edm_loss.mean() 
+            self.loss_scale * edm_loss.mean() 
             + self.img_weight * img_loss.mean()
             + self.hsv_weight * hsv_loss.mean()
         )
@@ -855,6 +857,7 @@ def main():
             learning_rate=hparams["learning_rate"],
             cache_size=100,  # Small cache for testing
             enable_cache=True,
+            loss_scale=10.0,  # Default EDM loss scaling
         )
         print("✓ Model initialized successfully")
         
