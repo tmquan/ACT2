@@ -74,23 +74,23 @@ PREDICT2_IMAGE2IMAGE_PIPELINE_2B = Video2WorldPipelineConfig(
     adjust_video_noise=True,
     conditioner=LazyCall(VideoConditioner)(
         fps=LazyCall(ReMapkey)(
-            dropout_rate=0.2,
+            dropout_rate=0.0,
             dtype=None,
             input_key="fps",
             output_key="fps",
         ),
         padding_mask=LazyCall(ReMapkey)(
-            dropout_rate=0.2,
+            dropout_rate=0.0,
             dtype=None,
             input_key="padding_mask",
             output_key="padding_mask",
         ),
         text=LazyCall(TextAttr)(
-            dropout_rate=0.2,
+            dropout_rate=0.0,
             input_key=["t5_text_embeddings"],
         ),
         use_video_condition=LazyCall(BooleanFlag)(
-            dropout_rate=0.2,
+            dropout_rate=0.0,
             input_key="fps",
             output_key="use_video_condition",
         ),
@@ -103,7 +103,7 @@ PREDICT2_IMAGE2IMAGE_PIPELINE_2B = Video2WorldPipelineConfig(
     rectified_flow_t_scaling_factor=1.0,
     resize_online=True,
     resolution="720",
-    ema=LazyCall(EMAConfig)(enabled=True),  # Enable EMA
+    ema=LazyCall(EMAConfig)(enabled=False),  # Disable EMA for stable generation
     sigma_conditional=0.0001,
     sigma_data=1.0,
     state_ch=16,
@@ -589,6 +589,19 @@ class ACT2CosmosPredict2Module(LightningModule):
 
     def _generate_denoised_image(self, data_batch: dict):
         """Generate denoised image for visualization/validation."""
+        # Ensure all models are in eval mode for consistent generation
+        was_training = self.pipe.denoising_model().training
+        self.pipe.denoising_model().eval()
+        
+        # Ensure frozen components stay frozen and in eval mode
+        if hasattr(self.pipe, 'tokenizer') and hasattr(self.pipe.tokenizer, 'model'):
+            self.pipe.tokenizer.model.model.eval()
+            self.pipe.tokenizer.model.model.requires_grad_(False)
+        
+        if hasattr(self.pipe, 'text_encoder') and self.pipe.text_encoder is not None:
+            self.pipe.text_encoder.eval()
+            self.pipe.text_encoder.requires_grad_(False)
+        
         with torch.no_grad():
             x0_fn = self.pipe.get_x0_fn_from_batch(data_batch, guidance=7.0, is_negative_prompt=False)
             _T, _H, _W = data_batch["video"].shape[-3:]
@@ -616,6 +629,36 @@ class ACT2CosmosPredict2Module(LightningModule):
             samples = x0_fn(sample, sigma_min.repeat(sample.shape[0]))
             video = self.pipe.decode(samples)
             self.last_prediction = video[:, :, 1, :, :]
+            
+        # Restore original training state
+        if was_training:
+            self.pipe.denoising_model().train()
+
+    def _debug_model_states(self):
+        """Debug method to check model states and gradients."""
+        print("\n" + "="*60)
+        print("MODEL STATE DEBUGGING")
+        print("="*60)
+        
+        # Check DiT model
+        dit_training = self.pipe.denoising_model().training
+        dit_requires_grad = any(p.requires_grad for p in self.pipe.denoising_model().parameters())
+        print(f"DiT Model - Training: {dit_training}, Requires Grad: {dit_requires_grad}")
+        
+        # Check tokenizer
+        if hasattr(self.pipe, 'tokenizer') and hasattr(self.pipe.tokenizer, 'model'):
+            tok_training = self.pipe.tokenizer.model.model.training
+            tok_requires_grad = any(p.requires_grad for p in self.pipe.tokenizer.model.model.parameters())
+            print(f"Tokenizer - Training: {tok_training}, Requires Grad: {tok_requires_grad}")
+        
+        # Check text encoder
+        if hasattr(self.pipe, 'text_encoder') and self.pipe.text_encoder is not None:
+            if hasattr(self.pipe.text_encoder, 'training'):
+                te_training = self.pipe.text_encoder.training
+                te_requires_grad = any(p.requires_grad for p in self.pipe.text_encoder.parameters())
+                print(f"Text Encoder - Training: {te_training}, Requires Grad: {te_requires_grad}")
+        
+        print("="*60)
 
     def setup(self, stage: str):
         """Configure models for different training stages."""
@@ -660,34 +703,26 @@ class ACT2CosmosPredict2Module(LightningModule):
     
     def _shared_step(self, data_batch):
         """Shared step for training and validation."""
-        # Process the batch
+        # Process the batch to get it in the right format
         result_batch = self._process_batch(data_batch)
         
-        # Get video data and encode to latent space
-        video = result_batch["video"]
-        video_latents = self.pipe.encode(video)
+        # Use the pipeline's get_data_and_condition method for consistent processing
+        raw_state, latent_state, condition = self.pipe.get_data_and_condition(result_batch)
         
         # Draw training noise parameters
         sigma, epsilon = self._draw_training_sigma_and_epsilon(
-            video_latents.shape, 
+            latent_state.shape, 
             is_video_batch=True
         )
         
-        # Get conditioning using the correct method - follow the pipeline's logic
-        condition = self.pipe.conditioner(result_batch)
-        condition = condition.edit_data_type(DataType.VIDEO)  # Set as video data type
-        
-        # Set video condition with the encoded latent state as gt_frames
-        condition = condition.set_video_condition(
-            gt_frames=video_latents.to(dtype=self.precision),
-            random_min_num_conditional_frames=1,  # Use our num_conditional_frames
-            random_max_num_conditional_frames=1,
-            num_conditional_frames=1,
+        # Handle model parallelism (context parallelism)
+        latent_state, condition, epsilon, sigma = self.pipe.broadcast_split_for_model_parallelsim(
+            latent_state, condition, epsilon, sigma
         )
         
         # Compute EDM loss
         output_batch, loss = self._compute_loss(
-            x0=video_latents,
+            x0=latent_state,
             condition=condition,
             epsilon=epsilon,
             sigma=sigma
@@ -714,6 +749,12 @@ class ACT2CosmosPredict2Module(LightningModule):
         self.log("train_img_loss", step_output["img_loss"], on_step=True, on_epoch=True)
         self.log("train_hsv_loss", step_output["hsv_loss"], on_step=True, on_epoch=True)
         
+        # Generate sample predictions for visualization (on first batch only)
+        if batch_idx == 0:
+            # Debug model states before generation
+            # self._debug_model_states()
+            self._generate_denoised_image(step_output["result_batch"])
+
         return step_output["loss"]
 
     def validation_step(self, batch: dict, batch_idx: int) -> None:
@@ -729,6 +770,8 @@ class ACT2CosmosPredict2Module(LightningModule):
         
         # Generate sample predictions for visualization (on first batch only)
         if batch_idx == 0:
+            # Debug model states before generation
+            # self._debug_model_states()
             self._generate_denoised_image(step_output["result_batch"])
 
     def test_step(self, batch: dict, batch_idx: int) -> None:
