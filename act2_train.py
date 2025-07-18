@@ -16,11 +16,11 @@ def main(hparams):
         root_folder=hparams.data_root,
         image_H=512,
         image_W=512,
-        micro_batch_size=4,
+        micro_batch_size=8,
         train_samples=4000,
         val_samples=800,
         test_samples=800,
-        num_workers=64,
+        num_workers=32,
         pin_memory=True,
         persistent_workers=True,
         use_thread_dataloader=True,
@@ -82,8 +82,8 @@ if __name__ == "__main__":
                         default="checkpoints/nvidia/Cosmos-Predict2-2B-Video2World/tokenizer/tokenizer.pth")
     parser.add_argument("--text_encoder_path", type=str, help="Path to the text encoder model.",
                         default="checkpoints/google-t5/t5-11b")
-    parser.add_argument("--hsv_weight", type=float, default=0.1, help="Weight for HSV loss.")
-    parser.add_argument("--img_weight", type=float, default=0.1, help="Weight for IMG loss.")
+    parser.add_argument("--hsv_weight", type=float, default=0.0, help="Weight for HSV loss.")
+    parser.add_argument("--img_weight", type=float, default=0.0, help="Weight for IMG loss.")
     
     # Add cache-specific arguments
     parser.add_argument("--cache_size", type=int, default=10000, help="Size of text embedding cache.")

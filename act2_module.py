@@ -74,13 +74,13 @@ PREDICT2_IMAGE2IMAGE_PIPELINE_2B = Video2WorldPipelineConfig(
     adjust_video_noise=True,
     conditioner=LazyCall(VideoConditioner)(
         fps=LazyCall(ReMapkey)(
-            dropout_rate=0.0,
+            dropout_rate=0.2,
             dtype=None,
             input_key="fps",
             output_key="fps",
         ),
         padding_mask=LazyCall(ReMapkey)(
-            dropout_rate=0.0,
+            dropout_rate=0.2,
             dtype=None,
             input_key="padding_mask",
             output_key="padding_mask",
@@ -90,7 +90,7 @@ PREDICT2_IMAGE2IMAGE_PIPELINE_2B = Video2WorldPipelineConfig(
             input_key=["t5_text_embeddings"],
         ),
         use_video_condition=LazyCall(BooleanFlag)(
-            dropout_rate=0.0,
+            dropout_rate=0.2,
             input_key="fps",
             output_key="use_video_condition",
         ),
@@ -107,7 +107,7 @@ PREDICT2_IMAGE2IMAGE_PIPELINE_2B = Video2WorldPipelineConfig(
     sigma_conditional=0.0001,
     sigma_data=1.0,
     state_ch=16,
-    state_t=24,  # Was 24
+    state_t=2,  # Was 24
     text_encoder_class="T5",
     tokenizer=LazyCall(TokenizerInterface)(
         chunk_duration=2,
@@ -497,7 +497,7 @@ class ACT2CosmosPredict2Module(LightningModule):
     def _convert_to_rgb_range(self, x):
         """Convert from model latent space to RGB [0, 1] range for image domain losses."""
         # Decode latents to image space using the pipeline decoder
-        video = self.pipe.decode(x)
+        video = self.pipe.decode(x) / 2.0 + 0.5
         # Ensure values are in [0, 1] range
         rgb = torch.clamp(video, 0.0, 1.0)
         return rgb
