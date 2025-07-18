@@ -248,6 +248,8 @@ class ACT2CosmosPredict2Module(LightningModule):
         # Load checkpoints
         self._load_checkpoints()
 
+
+
     def _load_checkpoints(self):
         """Load all model checkpoints and configure them appropriately."""
         # Load DiT model if path provided
@@ -306,18 +308,32 @@ class ACT2CosmosPredict2Module(LightningModule):
 
         init_frame = cond_frame.clone().unsqueeze(2)
         last_frame = true_frame.clone().unsqueeze(2)
-        orig_video = torch.concat([init_frame, last_frame], dim=2)
-        B, C, _, H, W = orig_video.shape
-
-        # Create more frames by repeating true_frame to ensure tokenizer compatibility
-        # Need at least 6 additional frames to handle tokenizer chunking edge cases
-        num_padding = 6
-        copy_stream = true_frame.clone().unsqueeze(2).repeat(1, 1, num_padding, 1, 1)
-        video = torch.cat([init_frame, last_frame, copy_stream], dim=2)     
         
+        # Create base video with two frames: conditioning frame + target frame
+        video = torch.cat([init_frame, last_frame], dim=2)   
+        
+        # Get expected frame count from tokenizer configuration and extend if needed
+        try:
+            expected_length = self.pipe.tokenizer.get_pixel_num_frames(self.pipe.config.state_t)
+            original_length = video.shape[2]  # Should be 2
+            
+            if original_length < expected_length:
+                # Need more frames - repeat the last frame only
+                additional_frames_needed = expected_length - original_length
+                repeated_last_frame = last_frame.repeat(1, 1, additional_frames_needed, 1, 1)
+                video = torch.cat([video, repeated_last_frame], dim=2)
+            elif original_length > expected_length:
+                # This shouldn't happen with our 2-frame setup, but handle it safely
+                # Keep the first frame (conditioning) and truncate the rest
+                video = video[:, :, :expected_length, :, :]
+            
+        except Exception as e:
+            print(f"Warning: Could not apply temporal sampling: {e}")
+            # Continue with 2-frame video if sampling fails
+
         # Convert to uint8
         video = (video * 255.0).to(torch.uint8)
-            
+        B, C, T, H, W = video.shape
         # Use cached text embeddings for better performance
         text_embeddings = self._encode_prompts_with_cache(prompts=prompts, device=_device)
         

@@ -16,7 +16,7 @@ def main(hparams):
         root_folder=hparams.data_root,
         image_H=512,
         image_W=512,
-        micro_batch_size=8,
+        micro_batch_size=4,
         train_samples=4000,
         val_samples=800,
         test_samples=800,
