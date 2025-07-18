@@ -443,21 +443,7 @@ class ACT2CosmosPredict2Module(LightningModule):
         self._text_cache[cache_key] = embeddings.clone().detach()
         self._cache_order.append(cache_key)
 
-    def _get_cache_stats(self) -> dict:
-        """Get cache performance statistics."""
-        total_requests = self._cache_hits + self._cache_misses
-        hit_rate = self._cache_hits / total_requests if total_requests > 0 else 0.0
-        
-        return {
-            "cache_size": len(self._text_cache),
-            "max_cache_size": self.cache_size,
-            "cache_hits": self._cache_hits,
-            "cache_misses": self._cache_misses,
-            "hit_rate": hit_rate,
-            "enabled": self.enable_cache
-        }
-
-    def _clear_cache(self):
+    def _clear_in_cache(self):
         """Clear the text embedding cache."""
         cache_size_before = len(self._text_cache)
         self._text_cache.clear()
@@ -478,7 +464,7 @@ class ACT2CosmosPredict2Module(LightningModule):
         self.log("cache_misses_total", stats["cache_misses"], logger=True)
         self.log("cache_enabled", float(stats["enabled"]), logger=True)
 
-    def _print_cache_stats(self):
+    def _put_cache_stats(self):
         """Print cache performance statistics (for debugging only)."""
         stats = self._get_cache_stats()
         print("\n" + "="*50)
@@ -493,6 +479,20 @@ class ACT2CosmosPredict2Module(LightningModule):
         
         # Also log to the logger
         self._log_cache_stats()
+
+    def _get_cache_stats(self) -> dict:
+        """Get cache performance statistics."""
+        total_requests = self._cache_hits + self._cache_misses
+        hit_rate = self._cache_hits / total_requests if total_requests > 0 else 0.0
+        
+        return {
+            "cache_size": len(self._text_cache),
+            "max_cache_size": self.cache_size,
+            "cache_hits": self._cache_hits,
+            "cache_misses": self._cache_misses,
+            "hit_rate": hit_rate,
+            "enabled": self.enable_cache
+        }
 
     def _convert_to_rgb_range(self, x):
         """Convert from model latent space to RGB [0, 1] range for image domain losses."""
@@ -832,7 +832,7 @@ def main():
             print(f"Embeddings shape: {embeddings.shape}")
         
         # Print final cache statistics for debugging
-        model._print_cache_stats()
+        model._put_cache_stats()
         
         # Also test logging functionality
         print("\nTesting logging functionality...")
