@@ -103,7 +103,7 @@ PREDICT2_IMAGE2IMAGE_PIPELINE_2B = Video2WorldPipelineConfig(
     rectified_flow_t_scaling_factor=1.0,
     resize_online=True,
     resolution="720",
-    ema=LazyCall(EMAConfig)(enabled=False),  # Disable EMA for stable generation
+    ema=LazyCall(EMAConfig)(enabled=False),  # Disable EMA
     sigma_conditional=0.0001,
     sigma_data=1.0,
     state_ch=16,
@@ -127,6 +127,7 @@ PREDICT2_IMAGE2IMAGE_PIPELINE_2B = Video2WorldPipelineConfig(
         enabled=True,
     ),
 )
+
 
 class CosmosPredict2Module(LightningModule):
     def __init__(self, 
@@ -205,6 +206,7 @@ class CosmosPredict2Module(LightningModule):
     def on_predict_epoch_end(self):
         pass
 
+
 class ACT2CosmosPredict2Module(LightningModule):
     def __init__(self, 
         dit_path: str = "checkpoints/nvidia/Cosmos-Predict2-2B-Video2World/model-720p-16fps-natten.pt",
@@ -249,8 +251,6 @@ class ACT2CosmosPredict2Module(LightningModule):
         
         # Load checkpoints
         self._load_checkpoints()
-
-
 
     def _load_checkpoints(self):
         """Load all model checkpoints and configure them appropriately."""
