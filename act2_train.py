@@ -88,7 +88,7 @@ if __name__ == "__main__":
     parser.add_argument("--loss_scale", type=float, default=10, help="Scale factor for EDM loss.")
     
     # Add cache-specific arguments
-    parser.add_argument("--cache_size", type=int, default=2000, help="Size of text embedding cache.")
+    parser.add_argument("--cache_size", type=int, default=10000, help="Size of text embedding cache.")
     parser.add_argument("--enable_cache", action="store_true", default=True, help="Enable text embedding caching.")
     parser.add_argument("--disable_cache", action="store_true", default=False, help="Disable text embedding caching.")
 

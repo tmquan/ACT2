@@ -383,7 +383,7 @@ class ACT2CosmosPredict2Module(LightningModule):
             new_embeddings = self._encode_prompts_direct(prompts=prompts_to_encode, device=device)
             
             # Store individual embeddings in cache and update batch
-            for j, prompt_idx in enumerate(prompt_indices_to_encode):
+            for j, prompt_id in enumerate(prompt_indices_to_encode):
                 individual_embedding = new_embeddings[j:j+1]  # Keep batch dimension
                 cache_key = self._get_cache_key_single(prompts_to_encode[j])
                 
@@ -395,7 +395,7 @@ class ACT2CosmosPredict2Module(LightningModule):
                 
                 # Insert new embedding (will be added to end - most recent)
                 self._text_cache[cache_key] = individual_embedding.clone().detach()
-                batch_embeddings[prompt_idx] = individual_embedding
+                batch_embeddings[prompt_id] = individual_embedding
         
         # Concatenate all embeddings to form the final batch
         final_embeddings = torch.cat(batch_embeddings, dim=0)
