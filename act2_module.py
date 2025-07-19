@@ -238,8 +238,7 @@ class ACT2CosmosPredict2Module(LightningModule):
         # Text embedding cache configuration
         self.cache_size = cache_size
         self.enable_cache = enable_cache
-        self._text_cache = {}
-        self._cache_order = []  # For LRU eviction
+        self._text_cache = OrderedDict()  # OrderedDict for LRU tracking
         self._cache_hits = 0
         self._cache_misses = 0
         
@@ -355,31 +354,52 @@ class ACT2CosmosPredict2Module(LightningModule):
             # If caching is disabled, encode directly
             return self._encode_prompts_direct(prompts=prompts, device=device)
         
-        # Create a cache key from the prompts
-        cache_key = self._get_cache_key(prompts)
+        batch_embeddings = []
+        prompts_to_encode = []
+        prompt_indices_to_encode = []
         
-        # Check if embeddings are already cached
-        if cache_key in self._text_cache:
-            self._cache_hits += 1
-            # Move to end for LRU tracking
-            self._cache_order.remove(cache_key)
-            self._cache_order.append(cache_key)
+        # Check cache for each individual prompt
+        for i, prompt in enumerate(prompts):
+            cache_key = self._get_cache_key_single(prompt)
             
-            cached_embeddings = self._text_cache[cache_key]
-            # Log cache hit
-            self.log("cache_hits", self._cache_hits, on_step=True, logger=True)
-            return cached_embeddings
+            if cache_key in self._text_cache:
+                # Cache hit - reuse existing embedding and move to end (most recent)
+                self._cache_hits += 1
+                cached_embedding = self._text_cache[cache_key]
+                # Move to end for LRU tracking (most recently used)
+                self._text_cache.move_to_end(cache_key)
+                batch_embeddings.append(cached_embedding)
+                self.log("cache_hits", self._cache_hits, on_step=True, logger=True)
+            else:
+                # Cache miss - need to encode this prompt
+                self._cache_misses += 1
+                prompts_to_encode.append(prompt)
+                prompt_indices_to_encode.append(i)
+                batch_embeddings.append(None)  # Placeholder
+                self.log("cache_misses", self._cache_misses, on_step=True, logger=True)
         
-        # Cache miss - compute embeddings
-        self._cache_misses += 1
-        embeddings = self._encode_prompts_direct(prompts=prompts, device=device)
+        # Encode missing prompts if any
+        if prompts_to_encode:
+            new_embeddings = self._encode_prompts_direct(prompts=prompts_to_encode, device=device)
+            
+            # Store individual embeddings in cache and update batch
+            for j, prompt_idx in enumerate(prompt_indices_to_encode):
+                individual_embedding = new_embeddings[j:j+1]  # Keep batch dimension
+                cache_key = self._get_cache_key_single(prompts_to_encode[j])
+                
+                # Check if cache is full and evict oldest (first) item
+                if len(self._text_cache) >= self.cache_size:
+                    # Remove least recently used item (first in OrderedDict)
+                    self._text_cache.popitem(last=False)
+                    self.log("cache_evictions", 1, on_step=True, logger=True)
+                
+                # Insert new embedding (will be added to end - most recent)
+                self._text_cache[cache_key] = individual_embedding.clone().detach()
+                batch_embeddings[prompt_idx] = individual_embedding
         
-        # Store in cache
-        self._store_in_cache(cache_key, embeddings)
-        
-        # Log cache miss
-        self.log("cache_misses", self._cache_misses, on_step=True, logger=True)
-        return embeddings
+        # Concatenate all embeddings to form the final batch
+        final_embeddings = torch.cat(batch_embeddings, dim=0)
+        return final_embeddings
 
     def _encode_prompts_direct(self, prompts: List[str], device: torch.device) -> torch.Tensor:
         """Directly encode prompts without caching."""
@@ -422,8 +442,14 @@ class ACT2CosmosPredict2Module(LightningModule):
             B = len(prompts)
             return torch.zeros((B, 77, 4096), dtype=self.precision, device=device)
 
+    def _get_cache_key_single(self, prompt: str) -> str:
+        """Generate a unique cache key for a single prompt."""
+        # Create a hash of the prompt
+        cache_key = hashlib.md5(prompt.encode('utf-8')).hexdigest()
+        return cache_key
+
     def _get_cache_key(self, prompts: List[str]) -> str:
-        """Generate a unique cache key for a list of prompts."""
+        """Generate a unique cache key for a list of prompts (legacy method)."""
         # Sort prompts to ensure consistent hashing regardless of order
         sorted_prompts = sorted(prompts)
         # Create a hash of the concatenated prompts
@@ -431,25 +457,10 @@ class ACT2CosmosPredict2Module(LightningModule):
         cache_key = hashlib.md5(prompt_str.encode('utf-8')).hexdigest()
         return cache_key
 
-    def _store_in_cache(self, cache_key: str, embeddings: torch.Tensor):
-        """Store embeddings in cache with LRU eviction."""
-        # Check if cache is full
-        if len(self._text_cache) >= self.cache_size:
-            # Remove least recently used item
-            lru_key = self._cache_order.pop(0)
-            del self._text_cache[lru_key]
-            # Log cache eviction
-            self.log("cache_evictions", 1, on_step=True, logger=True)
-        
-        # Store new item
-        self._text_cache[cache_key] = embeddings.clone().detach()
-        self._cache_order.append(cache_key)
-
-    def _clear_in_cache(self):
+    def _clear_cache(self):
         """Clear the text embedding cache."""
         cache_size_before = len(self._text_cache)
-        self._text_cache.clear()
-        self._cache_order.clear()
+        self._text_cache.clear()  # OrderedDict.clear() works the same
         self._cache_hits = 0
         self._cache_misses = 0
         # Log cache clearing
@@ -470,7 +481,7 @@ class ACT2CosmosPredict2Module(LightningModule):
         """Print cache performance statistics (for debugging only)."""
         stats = self._get_cache_stats()
         print("\n" + "="*50)
-        print("TEXT EMBEDDING CACHE STATISTICS")
+        print("TEXT EMBEDDING CACHE STATISTICS (OrderedDict LRU)")
         print("="*50)
         print(f"Cache Status: {'Enabled' if stats['enabled'] else 'Disabled'}")
         print(f"Cache Size: {stats['cache_size']}/{stats['max_cache_size']}")
@@ -846,7 +857,7 @@ def main():
             tokenizer_path=hparams["tokenizer_path"],
             text_encoder_path=hparams["text_encoder_path"],
             learning_rate=hparams["learning_rate"],
-            cache_size=100,  # Small cache for testing
+            cache_size=3,  # Small cache for testing LRU eviction
             enable_cache=True,
             loss_scale=10.0,  # Default EDM loss scaling
         )
@@ -854,19 +865,34 @@ def main():
         
         # Test caching functionality
         print("\n" + "="*50)
-        print("TESTING TEXT EMBEDDING CACHE")
+        print("TESTING OrderedDict LRU CACHE (cache_size=3)")
         print("="*50)
         
         test_prompts = [
-            ["A cat sitting on a chair", "A dog running in the park"],
-            ["A beautiful sunset over mountains", "A calm lake reflecting trees"],
-            ["A cat sitting on a chair", "A dog running in the park"],  # Duplicate for cache hit
+            ["prompt_A", "prompt_B"],  # Fill cache with 2 items
+            ["prompt_C"],  # Add 3rd item (cache full)
+            ["prompt_D"],  # Add 4th item - should evict prompt_A (oldest)
+            ["prompt_A"],  # Should be cache miss (was evicted)
+            ["prompt_B", "prompt_C"],  # Should be cache hits, move to end
+            ["prompt_E"],  # Add 5th item - should evict prompt_D (oldest)
+            ["prompt_D"],  # Should be cache miss (was evicted)
         ]
         
         for i, prompts in enumerate(test_prompts):
-            print(f"\nTest {i+1}: Encoding {len(prompts)} prompts")
+            print(f"\nTest {i+1}: Encoding batch of {len(prompts)} prompts")
+            print(f"Prompts: {prompts}")
             embeddings = model._encode_prompts_with_cache(prompts=prompts, device=torch.device('cpu'))
             print(f"Embeddings shape: {embeddings.shape}")
+            
+            # Show current cache stats after each batch
+            stats = model._get_cache_stats()
+            print(f"Cache: {stats['cache_size']}/{stats['max_cache_size']}, "
+                  f"Hits: {stats['cache_hits']}, Misses: {stats['cache_misses']}")
+            
+            # Show cache contents (keys only for debugging)
+            cache_keys = list(model._text_cache.keys())
+            cache_prompts = [list(model._text_cache.keys())]  # Just show we have the keys
+            print(f"Cache contains {len(cache_keys)} items")
         
         # Print final cache statistics for debugging
         model._put_cache_stats()
