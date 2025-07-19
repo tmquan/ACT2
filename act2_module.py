@@ -589,7 +589,7 @@ class ACT2CosmosPredict2Module(LightningModule):
         
         return output_batch, ret_loss
 
-    def _generate_denoised_image(self, data_batch: dict):
+    def _generate_denoised_image(self, data_batch: dict, frame_id: int=1):
         """Generate denoised image for visualization/validation."""
         # Ensure all models are in eval mode for consistent generation
         was_training = self.pipe.denoising_model().training
@@ -630,7 +630,7 @@ class ACT2CosmosPredict2Module(LightningModule):
             sigma_min = scheduler.sigmas[-1].to(sample.device, dtype=torch.float32)
             samples = x0_fn(sample, sigma_min.repeat(sample.shape[0]))
             video = self.pipe.decode(samples)
-            self.last_prediction = video[:, :, 1, :, :]
+            self.last_prediction = video[:, :, frame_id, :, :]
             
         # Restore original training state
         if was_training:
@@ -755,7 +755,7 @@ class ACT2CosmosPredict2Module(LightningModule):
         if batch_idx == 0:
             # Debug model states before generation
             # self._debug_model_states()
-            self._generate_denoised_image(step_output["result_batch"])
+            self._generate_denoised_image(step_output["result_batch"], frame_id=1)
 
         return step_output["loss"]
 
@@ -774,7 +774,7 @@ class ACT2CosmosPredict2Module(LightningModule):
         if batch_idx == 0:
             # Debug model states before generation
             # self._debug_model_states()
-            self._generate_denoised_image(step_output["result_batch"])
+            self._generate_denoised_image(step_output["result_batch"], frame_id=1)
 
     def test_step(self, batch: dict, batch_idx: int) -> None:
         """Test step using EDM loss."""
@@ -790,7 +790,7 @@ class ACT2CosmosPredict2Module(LightningModule):
     def predict_step(self, batch: dict, batch_idx: int) -> None:
         """Predict step for inference."""
         result_batch = self._process_batch(batch)
-        self._generate_denoised_image(result_batch)
+        self._generate_denoised_image(result_batch, frame_id=1)
         return self.last_prediction
     
     def on_train_epoch_start(self):
